@@ -46,7 +46,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          mkdir -p "$HOME/.openclaw/workspace/skills"
+          mkdir -p "$HOME/.openclaw/workspace"
           
           # Inisialisasi provider Groq dasar
           openclaw onboard --non-interactive --accept-risk \
@@ -54,7 +54,7 @@ jobs:
             --groq-api-key "$GROQ_API_KEY" \
             --skip-channels --skip-skills --skip-daemon || true
 
-          # Daftarkan model Gemini 3.8 Flash (pengganti resmi 2.5 Flash) & Groq Llama 3.1 8B (TPM besar)
+          # Daftarkan model Gemini 3.8 Flash & Groq Llama 3.1 8B
           openclaw config set models.providers.groq.models '[{"id":"llama-3.1-8b-instant","name":"Llama 3.1 8B Instant"}]' --strict-json --merge || true
           openclaw config set agents.defaults.models '{"google/gemini-3.8-flash":{},"groq/llama-3.1-8b-instant":{}}' --strict-json --merge || true
           openclaw models set google/gemini-3.8-flash || true
@@ -68,11 +68,13 @@ jobs:
           EOF
           chmod 600 "$HOME/.openclaw/.env"
 
-          # Copy langsung 5 skill inti (bukan symlink) agar lolos validasi keamanan OpenClaw & hemat token
+          # Install skill lalu ganti symlink dengan folder fisik 5 skill inti
           cd "$HOME/.openclaw/workspace"
           npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
+          rm -rf "$HOME/.openclaw/workspace/skills"
+          mkdir -p "$HOME/.openclaw/workspace/skills"
           for s in binance-agentic-wallet query-token-audit query-token-info query-address-info crypto-market-rank; do
-            cp -r "$HOME/.openclaw/workspace/.agents/skills/$s" "$HOME/.openclaw/workspace/skills/$s"
+            cp -r "$HOME/.openclaw/workspace/.agents/skills/$s" "$HOME/.openclaw/workspace/skills/"
           done
           rm -rf "$HOME/.openclaw/workspace/.agents"
 
