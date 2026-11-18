@@ -81,7 +81,7 @@ jobs:
 
           openclaw models status
 
-          - name: Execute Agent Cycle & Notify Telegram
+      - name: Execute Agent Cycle & Notify Telegram
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
