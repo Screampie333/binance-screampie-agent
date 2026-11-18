@@ -55,7 +55,7 @@ jobs:
           EOF
           chmod 600 "$HOME/.openclaw/.env"
           cd "$HOME/.openclaw/workspace"
-          npx -y skills add binance/binance-skills-hub/skills/binance-web3
+          npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
           openclaw models set google/gemini-2.5-flash || true
           openclaw models fallbacks add groq/openai/gpt-oss-120b || true
 
