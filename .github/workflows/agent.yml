@@ -47,27 +47,50 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           mkdir -p "$HOME/.openclaw/workspace"
-          
-          # Inisialisasi dasar
+
+          # Inisialisasi dasar OpenClaw
           openclaw onboard --non-interactive --accept-risk \
             --auth-choice groq-api-key \
             --groq-api-key "$GROQ_API_KEY" \
             --skip-channels --skip-skills --skip-daemon || true
 
-          # 1. Deteksi model aktif di akun Google AI Studio kamu (limit 250.000 TPM)
-          GEMINI_JSON=$(curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}")
-          echo "Daftar model Gemini aktif:"
-          echo "$GEMINI_JSON" | node -e '
-            const d=JSON.parse(require("fs").readFileSync(0,"utf8"));
-            const ids=(d.models||[]).filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent")).map(m=>m.name.replace("models/",""));
-            console.log(ids.join(", "));
-          '
+          # Daftarkan model Gemini aktif dari akun kamu (ringan, cepat, bebas limit)
+          openclaw config set agents.defaults.models '{"google/gemini-3.1-flash-lite":{},"google/gemini-3.5-flash-lite":{},"google/gemini-3.7-flash":{},"google/gemini-3.8-flash":{}}' --strict-json --merge || true
+          openclaw models set google/gemini-3.1-flash-lite || true
+          openclaw models fallbacks add google/gemini-3.5-flash-lite || true
+          openclaw models fallbacks add google/gemini-3.7-flash || true
+          openclaw models fallbacks add google/gemini-3.8-flash || true
 
-          PRIMARY_GEMINI=$(echo "$GEMINI_JSON" | node -e '
-            const d=JSON.parse(require("fs").readFileSync(0,"utf8"));
-            const ids=(d.models||[])
-              .filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent"))
-              .map(m=>m.name.replace("models/",""))
-              .filter(id=>id.includes("flash") && !id.includes("image") && !id.includes("tts") && !id.includes("thinking") && !id.includes("argon"));
-            const preferred = ids.find(id=>id.includes("3.8-flash-lite")) || ids.find(id=>id.includes("flash-lite")) || ids.find(id=>id.includes("3.8-flash")) || ids[0];
-            console.
+          cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
+          cat <<EOF > "$HOME/.openclaw/.env"
+          GEMINI_API_KEY=${GEMINI_API_KEY}
+          GROQ_API_KEY=${GROQ_API_KEY}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          EOF
+          chmod 600 "$HOME/.openclaw/.env"
+
+          # Install 3 skill inti & ganti symlink jadi folder fisik
+          cd "$HOME/.openclaw/workspace"
+          npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
+          rm -rf "$HOME/.openclaw/workspace/skills"
+          mkdir -p "$HOME/.openclaw/workspace/skills"
+          for s in binance-agentic-wallet query-token-audit query-token-info; do
+            cp -r "$HOME/.openclaw/workspace/.agents/skills/$s" "$HOME/.openclaw/workspace/skills/"
+          done
+          rm -rf "$HOME/.openclaw/workspace/.agents"
+
+          openclaw models status
+
+      - name: Execute Agent Cycle & Notify Telegram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cd "$HOME/.openclaw/workspace"
+          RESULT=$(openclaw agent --local --message "Periksa status wallet & sisa gas menggunakan baw CLI, lalu cek peluang terbaru untuk Free Mint (NFT & Token), Klaim khusus pemegang Agent ID, dan Kampanye Tugas Agent. Ikuti aturan ketat di AGENTS.md. Buat ringkasan singkat hasil pengecekanmu.")
+          echo "$RESULT"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${RESULT}"
