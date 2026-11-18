@@ -1,0 +1,65 @@
+name: Binance Agent 24/7 Worker
+
+on:
+  schedule:
+    # Jalan otomatis setiap 15 menit (24/7)
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install baw CLI & OpenClaw
+        run: |
+          npm install -g @binance/agentic-wallet@1.12.0
+          curl -fsSL https://openclaw.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.openclaw/bin" >> $GITHUB_PATH
+
+      - name: Restore Binance Wallet Session
+        env:
+          BAW_SESSION_B64: ${{ secrets.BAW_SESSION_B64 }}
+        run: |
+          echo "$BAW_SESSION_B64" | base64 -d > /tmp/baw.tar.gz
+          tar -xzf /tmp/baw.tar.gz -C "$HOME"
+          rm -f /tmp/baw.tar.gz
+          chmod 700 "$HOME/.baw"
+          baw wallet status --json
+
+      - name: Setup OpenClaw & Binance Skills
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          mkdir -p "$HOME/.openclaw/workspace"
+          cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
+          cat <<EOF > "$HOME/.openclaw/.env"
+          GEMINI_API_KEY=${GEMINI_API_KEY}
+          GROQ_API_KEY=${GROQ_API_KEY}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          EOF
+          chmod 600 "$HOME/.openclaw/.env"
+          cd "$HOME/.openclaw/workspace"
+          npx -y skills add binance/binance-skills-hub/skills/binance-web3
+          openclaw models set google/gemini-2.5-flash || true
+          openclaw models fallbacks add groq/openai/gpt-oss-120b || true
+
+      - name: Execute Agent Cycle & Notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cd "$HOME/.openclaw/workspace"
+          openclaw agent --message "Periksa status wallet & sisa gas, lalu cek peluang terbaru untuk Free Mint (NFT & Token), Klaim khusus pemegang Agent ID, dan Kampanye Tugas Agent. Ikuti aturan ketat di AGENTS.md. Jika ada aksi dieksekusi atau status penting, kirim ringkasan ke Telegram chat ID $TELEGRAM_CHAT_ID."
