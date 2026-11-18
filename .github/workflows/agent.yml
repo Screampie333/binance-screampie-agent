@@ -48,15 +48,16 @@ jobs:
         run: |
           mkdir -p "$HOME/.openclaw/workspace/skills"
           
-          # Inisialisasi dengan Groq sebagai base provider
+          # Inisialisasi provider Groq dasar
           openclaw onboard --non-interactive --accept-risk \
             --auth-choice groq-api-key \
             --groq-api-key "$GROQ_API_KEY" \
             --skip-channels --skip-skills --skip-daemon || true
 
-          # Daftarkan Gemini 2.5 Flash (250k TPM gratis) & Groq Llama 3.1 8B (TPM besar)
-          openclaw config set agents.defaults.models '{"google/gemini-2.5-flash":{},"groq/llama-3.1-8b-instant":{}}' --strict-json --merge || true
-          openclaw models set google/gemini-2.5-flash || true
+          # Daftarkan model Gemini 3.8 Flash (pengganti resmi 2.5 Flash) & Groq Llama 3.1 8B (TPM besar)
+          openclaw config set models.providers.groq.models '[{"id":"llama-3.1-8b-instant","name":"Llama 3.1 8B Instant"}]' --strict-json --merge || true
+          openclaw config set agents.defaults.models '{"google/gemini-3.8-flash":{},"groq/llama-3.1-8b-instant":{}}' --strict-json --merge || true
+          openclaw models set google/gemini-3.8-flash || true
           openclaw models fallbacks add groq/llama-3.1-8b-instant || true
 
           cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
@@ -67,12 +68,13 @@ jobs:
           EOF
           chmod 600 "$HOME/.openclaw/.env"
 
-          # Install skill, tapi hanya tautkan 5 skill inti agar tidak over-limit token
+          # Copy langsung 5 skill inti (bukan symlink) agar lolos validasi keamanan OpenClaw & hemat token
           cd "$HOME/.openclaw/workspace"
           npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
           for s in binance-agentic-wallet query-token-audit query-token-info query-address-info crypto-market-rank; do
-            ln -sfn "$HOME/.openclaw/workspace/.agents/skills/$s" "$HOME/.openclaw/workspace/skills/$s"
+            cp -r "$HOME/.openclaw/workspace/.agents/skills/$s" "$HOME/.openclaw/workspace/skills/$s"
           done
+          rm -rf "$HOME/.openclaw/workspace/.agents"
 
           openclaw models status
 
