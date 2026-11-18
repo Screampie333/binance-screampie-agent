@@ -81,7 +81,7 @@ jobs:
 
           openclaw models status
 
-      - name: Execute Agent Cycle & Notify Telegram
+          - name: Execute Agent Cycle & Notify Telegram
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -89,8 +89,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cd "$HOME/.openclaw/workspace"
-          RESULT=$(openclaw agent --local --message "Periksa status wallet & sisa gas menggunakan baw CLI, lalu cek peluang terbaru untuk Free Mint (NFT & Token), Klaim khusus pemegang Agent ID, dan Kampanye Tugas Agent. Ikuti aturan ketat di AGENTS.md. Buat ringkasan singkat hasil pengecekanmu.")
+          RESULT=$(openclaw agent --local --message "Periksa status wallet & sisa gas menggunakan baw CLI, lalu cek peluang terbaru untuk Free Mint (NFT & Token), Klaim khusus pemegang Agent ID, dan Kampanye Tugas Agent. Ikuti aturan ketat di AGENTS.md. Buat ringkasan singkat (maksimal 1500 karakter) hasil pengecekanmu.")
+          echo "=== HASIL AGENT ==="
           echo "$RESULT"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          
+          MSG="${RESULT:-⚠️ Agent selesai berjalan tetapi tidak menghasilkan teks output.}"
+          MSG="${MSG:0:3800}"
+          
+          TG_RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${RESULT}"
+            --data-urlencode "text=${MSG}")
+          echo "=== RESPON TELEGRAM ==="
+          echo "$TG_RESP"
