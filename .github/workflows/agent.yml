@@ -54,14 +54,27 @@ jobs:
             --groq-api-key "$GROQ_API_KEY" \
             --skip-channels --skip-skills --skip-daemon || true
 
-          # Konfigurasi lengkap Groq (baseUrl + api + model TPM besar)
-          openclaw config set models.providers.groq '{"baseUrl":"https://api.groq.com/openai/v1","api":"openai-completions","models":[{"id":"llama-3.1-8b-instant","name":"Llama 3.1 8B Instant"},{"id":"llama-3.3-70b-versatile","name":"Llama 3.3 70B Versatile"}]}' --strict-json --merge || true
+          # Ambil daftar model aktif langsung dari API Groq kamu secara otomatis
+          GROQ_JSON=$(curl -s -H "Authorization: Bearer $GROQ_API_KEY" https://api.groq.com/openai/v1/models)
+          echo "Daftar model Groq aktif:"
+          echo "$GROQ_JSON" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log((d.data||[]).map(m=>m.id).join(", "));'
 
-          # Daftarkan model utama & fallback berlapis
-          openclaw config set agents.defaults.models '{"groq/llama-3.1-8b-instant":{},"groq/llama-3.3-70b-versatile":{},"google/gemini-3.8-flash":{}}' --strict-json --merge || true
-          openclaw models set groq/llama-3.1-8b-instant || true
-          openclaw models fallbacks add groq/llama-3.3-70b-versatile || true
-          openclaw models fallbacks add google/gemini-3.8-flash || true
+          # Pilih model ringan & cepat dari daftar Groq aktif, lalu daftarkan ke OpenClaw
+          PRIMARY_GROQ=$(echo "$GROQ_JSON" | node -e '
+            const d=JSON.parse(require("fs").readFileSync(0,"utf8"));
+            const ids=(d.data||[]).map(m=>m.id).filter(id=>!id.includes("whisper") && !id.includes("guard") && !id.includes("tts"));
+            const preferred = ids.find(id=>id.includes("20b") || id.includes("scout") || id.includes("8b") || id.includes("instant")) || ids.find(id=>id.includes("gpt-oss-120b")) || ids[0];
+            console.log(preferred || "openai/gpt-oss-120b");
+          ')
+          echo "Model Groq terpilih: $PRIMARY_GROQ"
+
+          openclaw config set models.providers.groq "{\"baseUrl\":\"https://api.groq.com/openai/v1\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"$PRIMARY_GROQ\",\"name\":\"$PRIMARY_GROQ\"},{\"id\":\"openai/gpt-oss-120b\",\"name\":\"GPT OSS 120B\"}]}" --strict-json --merge || true
+          openclaw config set agents.defaults.models "{\"groq/$PRIMARY_GROQ\":{},\"groq/openai/gpt-oss-120b\":{},\"google/gemini-3.8-flash\":{},\"google/gemini-3.8-flash-lite\":{}}" --strict-json --merge || true
+          
+          openclaw models set "groq/$PRIMARY_GROQ" || true
+          openclaw models fallbacks add "groq/openai/gpt-oss-120b" || true
+          openclaw models fallbacks add "google/gemini-3.8-flash-lite" || true
+          openclaw models fallbacks add "google/gemini-3.8-flash" || true
 
           cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
           cat <<EOF > "$HOME/.openclaw/.env"
