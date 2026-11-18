@@ -47,6 +47,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           mkdir -p "$HOME/.openclaw/workspace"
+          
+          # Inisialisasi OpenClaw secara non-interaktif dengan Gemini API Key
+          openclaw onboard --non-interactive --accept-risk \
+            --auth-choice gemini-api-key \
+            --gemini-api-key "$GEMINI_API_KEY" \
+            --skip-channels --skip-skills --skip-daemon || true
+
           cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
           cat <<EOF > "$HOME/.openclaw/.env"
           GEMINI_API_KEY=${GEMINI_API_KEY}
@@ -54,13 +61,13 @@ jobs:
           TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
           EOF
           chmod 600 "$HOME/.openclaw/.env"
+
           cd "$HOME/.openclaw/workspace"
           npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
-          
-          # Cek daftar model google yang tersedia di OpenClaw & set Groq sebagai primary
-          openclaw models list --provider google || true
-          openclaw config set agents.defaults.models '{"groq/openai/gpt-oss-120b":{}}' --strict-json --merge
-          openclaw models set groq/openai/gpt-oss-120b
+          ln -sfn "$HOME/.openclaw/workspace/.agents/skills" "$HOME/.openclaw/workspace/skills"
+
+          # Refresh katalog model & cek daftar model yang aktif
+          openclaw models list --refresh || true
           openclaw models status
 
       - name: Execute Agent Cycle & Notify Telegram
