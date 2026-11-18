@@ -46,17 +46,18 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          mkdir -p "$HOME/.openclaw/workspace"
+          mkdir -p "$HOME/.openclaw/workspace/skills"
           
-          # Pakai Groq sebagai otak utama gratis (bebas limit 429)
+          # Inisialisasi dengan Groq sebagai base provider
           openclaw onboard --non-interactive --accept-risk \
             --auth-choice groq-api-key \
             --groq-api-key "$GROQ_API_KEY" \
             --skip-channels --skip-skills --skip-daemon || true
 
-          # Daftarkan model Gemini free-tier yang valid sebagai cadangan (fallback)
-          openclaw config set agents.defaults.models '{"google/gemini-2.5-flash-lite":{},"google/gemini-2.5-flash":{}}' --strict-json --merge || true
-          openclaw models fallbacks add google/gemini-2.5-flash-lite || true
+          # Daftarkan Gemini 2.5 Flash (250k TPM gratis) & Groq Llama 3.1 8B (TPM besar)
+          openclaw config set agents.defaults.models '{"google/gemini-2.5-flash":{},"groq/llama-3.1-8b-instant":{}}' --strict-json --merge || true
+          openclaw models set google/gemini-2.5-flash || true
+          openclaw models fallbacks add groq/llama-3.1-8b-instant || true
 
           cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
           cat <<EOF > "$HOME/.openclaw/.env"
@@ -66,11 +67,13 @@ jobs:
           EOF
           chmod 600 "$HOME/.openclaw/.env"
 
+          # Install skill, tapi hanya tautkan 5 skill inti agar tidak over-limit token
           cd "$HOME/.openclaw/workspace"
           npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
-          ln -sfn "$HOME/.openclaw/workspace/.agents/skills" "$HOME/.openclaw/workspace/skills"
+          for s in binance-agentic-wallet query-token-audit query-token-info query-address-info crypto-market-rank; do
+            ln -sfn "$HOME/.openclaw/workspace/.agents/skills/$s" "$HOME/.openclaw/workspace/skills/$s"
+          done
 
-          openclaw models list --refresh || true
           openclaw models status
 
       - name: Execute Agent Cycle & Notify Telegram
