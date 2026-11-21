@@ -159,7 +159,7 @@ jobs:
           EOF
           node /tmp/select_bounty.mjs
 
-      - name: Build Code in OpenClaw Session, Push Repo & Submit to make.fun
+      - name: Build Code in OpenClaw Session, Push Repo & Submit via OpenAPI
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -205,7 +205,7 @@ jobs:
           const workDir = `/tmp/work-${slug}`;
           fs.mkdirSync(workDir, { recursive: true });
 
-          // 1. Jalankan OpenClaw KHUSUS untuk menulis kode & verifikasi kit (agar session .jsonl tertutup rapi saat exit)
+          // 1. Jalankan OpenClaw untuk menulis kode & verifikasi kit (agar session .jsonl tertutup rapi saat exit)
           const buildPrompt = [
             `Tugasmu membangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
             "JANGAN jalankan gh repo create dan JANGAN kirim submit API (skrip pipeline akan melakukannya otomatis setelah kamu selesai agar file .jsonl sesimu tertutup sempurna).",
@@ -236,7 +236,6 @@ jobs:
             process.exit(1);
           }
 
-          // Pastikan ada file kode di workDir
           const files = fs.readdirSync(workDir).filter(f => !f.startsWith("."));
           if (files.length === 0) {
             await notify(`⚠️ Direktori ${workDir} kosong setelah OpenClaw selesai.\n\nLog agent:\n${agentSummary.slice(0, 800)}`);
@@ -273,91 +272,158 @@ jobs:
             process.exit(1);
           }
 
-          // 3. Ambil file transkrip .jsonl asli OpenClaw yang sudah tertutup sempurna
-          const sessionsDir = path.join(home, ".openclaw", "agents", "main", "sessions");
-          let transcriptRaw = "";
-          let transcriptLines = [];
-          if (fs.existsSync(sessionsDir)) {
-            const jsonlFiles = fs.readdirSync(sessionsDir)
-              .filter(f => f.endsWith(".jsonl"))
-              .map(f => ({ name: f, full: path.join(sessionsDir, f), mtime: fs.statSync(path.join(sessionsDir, f)).mtimeMs }))
-              .sort((a, b) => b.mtime - a.mtime);
-            if (jsonlFiles.length > 0) {
-              transcriptRaw = fs.readFileSync(jsonlFiles[0].full, "utf8");
-              transcriptLines = transcriptRaw.split("\n").filter(Boolean).map(line => {
-                try { return JSON.parse(line); } catch { return { raw: line }; }
-              });
+          // 3. Pindai seluruh ~/.openclaw secara rekursif untuk menemukan file transkrip .jsonl asli
+          function findJsonlFiles(dir, results = []) {
+            if (!fs.existsSync(dir)) return results;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                findJsonlFiles(fullPath, results);
+              } else if (entry.name.endsWith(".jsonl")) {
+                const stat = fs.statSync(fullPath);
+                results.push({ fullPath, size: stat.size, mtime: stat.mtimeMs });
+              }
             }
+            return results;
           }
 
-          // 4. Baca spesifikasi submit dari SKILL.md & kirim langsung via fetch()
-          const skillMd = fs.readFileSync(path.join(workspace, "skills", "makefun", "SKILL.md"), "utf8");
-          let submitSpec = {
-            url: `https://make.fun/api/competitions/${slug}/submit`,
-            payload: {
-              repoUrl,
-              commitSha,
-              transcript: transcriptLines
-            }
-          };
+          const allJsonl = findJsonlFiles(path.join(home, ".openclaw")).sort((a, b) => b.size - a.size);
+          let transcriptRaw = "";
+          let transcriptLines = [];
+          let foundPath = "none";
 
-          try {
-            const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contents: [{
-                  parts: [{
-                    text: `Extract the exact HTTP submission endpoint URL and JSON request body keys from this make.fun SKILL.md for competition slug "${slug}". Return ONLY JSON with keys: "url" (full https://make.fun/api/... URL with "${slug}" substituted), "repoKey" (exact field name for repository URL), "commitKey" (exact field name for commit SHA, or null), "transcriptKey" (exact field name for transcript), "transcriptFormat" ("array" or "string" or "files_array").\n\nSKILL.MD:\n${skillMd}`
-                  }]
-                }],
-                generationConfig: { responseMimeType: "application/json" }
-              })
+          if (allJsonl.length > 0) {
+            foundPath = allJsonl[0].fullPath;
+            transcriptRaw = fs.readFileSync(foundPath, "utf8");
+            fs.writeFileSync("/tmp/openclaw_session_backup.jsonl", transcriptRaw);
+            transcriptLines = transcriptRaw.split("\n").filter(Boolean).map(line => {
+              try { return JSON.parse(line); } catch { return { raw: line }; }
             });
-            if (geminiRes.ok) {
-              const gData = await geminiRes.json();
-              const parsed = JSON.parse(gData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}");
-              if (parsed.url && parsed.repoKey && parsed.transcriptKey) {
-                const dynamicPayload = {
-                  [parsed.repoKey]: repoUrl
-                };
-                if (parsed.commitKey) dynamicPayload[parsed.commitKey] = commitSha;
-                if (parsed.transcriptFormat === "string") {
-                  dynamicPayload[parsed.transcriptKey] = transcriptRaw;
-                } else if (parsed.transcriptFormat === "files_array") {
-                  dynamicPayload[parsed.transcriptKey] = [{ name: "session.jsonl", content: transcriptRaw }];
-                } else {
-                  dynamicPayload[parsed.transcriptKey] = transcriptLines;
+          }
+
+          // 4. Baca spesifikasi resmi dari https://make.fun/api/openapi.json & SKILL.md
+          const skillMd = fs.readFileSync(path.join(workspace, "skills", "makefun", "SKILL.md"), "utf8");
+          let openApiFiltered = {};
+          try {
+            const oaRes = await fetch("https://make.fun/api/openapi.json", { headers: { Accept: "application/json" } });
+            if (oaRes.ok) {
+              const oa = await oaRes.json();
+              for (const [p, methods] of Object.entries(oa.paths || {})) {
+                if (/competitions|entries|submissions|submit|register/i.test(p)) {
+                  openApiFiltered[p] = methods;
                 }
-                submitSpec = { url: parsed.url, payload: dynamicPayload };
               }
             }
           } catch {}
 
-          let submitStatusLine = "";
+          const extractionPrompt = [
+            `Given make.fun's OpenAPI specification and SKILL.md below, determine the exact sequence of HTTP POST requests needed to enter/submit a repository to competition slug "${slug}".`,
+            "Return ONLY valid JSON with a key \"steps\" (array of objects). Each step object must have:",
+            "- \"url\": full URL starting with https://make.fun/api/... with any {slug} or {id} replaced by the actual slug or previous step ID",
+            "- \"method\": \"POST\"",
+            "- \"bodyTemplate\": JSON object where placeholders \"__REPO_URL__\", \"__COMMIT_SHA__\", \"__TRANSCRIPT_ARRAY__\", \"__TRANSCRIPT_STRING__\", \"__TRANSCRIPT_FILES__\", \"__SLUG__\" will be replaced by the runner.",
+            "",
+            "OPENAPI PATHS:",
+            JSON.stringify(openApiFiltered).slice(0, 14000),
+            "",
+            "SKILL.MD:",
+            skillMd.slice(0, 14000)
+          ].join("\n");
+
+          let plan = null;
           try {
-            const subRes = await fetch(submitSpec.url, {
+            const gRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "x-api-key": apiKey
-              },
-              body: JSON.stringify(submitSpec.payload)
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: extractionPrompt }] }],
+                generationConfig: { responseMimeType: "application/json" }
+              })
             });
-            const subText = await subRes.text();
-            submitStatusLine = `HTTP ${subRes.status} (${submitSpec.url}):\n${subText.slice(0, 900)}`;
-          } catch (err) {
-            submitStatusLine = `Gagal koneksi ke ${submitSpec.url}: ${err.message}`;
+            if (gRes.ok) {
+              const gData = await gRes.json();
+              plan = JSON.parse(gData?.candidates?.[0]?.content?.parts?.[0]?.text || "null");
+            }
+          } catch {}
+
+          if (!plan?.steps?.length && process.env.GROQ_API_KEY) {
+            try {
+              const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+                },
+                body: JSON.stringify({
+                  model: "llama-3.3-70b-versatile",
+                  response_format: { type: "json_object" },
+                  messages: [{ role: "user", content: extractionPrompt }]
+                })
+              });
+              if (groqRes.ok) {
+                const grData = await groqRes.json();
+                plan = JSON.parse(grData?.choices?.[0]?.message?.content || "null");
+              }
+            } catch {}
+          }
+
+          function injectValues(obj, prevId) {
+            if (typeof obj === "string") {
+              if (obj === "__TRANSCRIPT_ARRAY__") return transcriptLines;
+              if (obj === "__TRANSCRIPT_STRING__") return transcriptRaw;
+              if (obj === "__TRANSCRIPT_FILES__") return [{ name: "session.jsonl", content: transcriptRaw }];
+              return obj
+                .replaceAll("__REPO_URL__", repoUrl)
+                .replaceAll("__COMMIT_SHA__", commitSha)
+                .replaceAll("__SLUG__", slug)
+                .replaceAll("__PREV_ID__", prevId || "");
+            }
+            if (Array.isArray(obj)) return obj.map(v => injectValues(v, prevId));
+            if (obj && typeof obj === "object") {
+              const out = {};
+              for (const [k, v] of Object.entries(obj)) out[k] = injectValues(v, prevId);
+              return out;
+            }
+            return obj;
+          }
+
+          const stepLogs = [];
+          const steps = plan?.steps?.length
+            ? plan.steps
+            : [{ url: `https://make.fun/api/competitions/${slug}/entries`, method: "POST", bodyTemplate: { repoUrl: "__REPO_URL__", commitSha: "__COMMIT_SHA__", transcript: "__TRANSCRIPT_ARRAY__" } }];
+
+          let lastId = "";
+          for (const st of steps) {
+            const targetUrl = String(st.url || "").replaceAll("__PREV_ID__", lastId);
+            const payload = injectValues(st.bodyTemplate || {}, lastId);
+            try {
+              const res = await fetch(targetUrl, {
+                method: st.method || "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "x-api-key": apiKey
+                },
+                body: JSON.stringify(payload)
+              });
+              const txt = await res.text();
+              try {
+                const parsedRes = JSON.parse(txt);
+                lastId = parsedRes?.id || parsedRes?.entry?.id || parsedRes?.submission?.id || parsedRes?.data?.id || lastId;
+              } catch {}
+              stepLogs.push(`HTTP ${res.status} (${targetUrl}):\n${txt.slice(0, 700)}`);
+            } catch (err) {
+              stepLogs.push(`Error (${targetUrl}): ${err.message}`);
+            }
           }
 
           const finalReport = [
             `🚀 Autopilot Bounty: ${title} (${slug})`,
             `📦 Repo GitHub: ${repoUrl}`,
-            `🔖 Commit: ${commitSha.slice(0, 7)} | Transcript turns: ${transcriptLines.length}`,
+            `🔖 Commit: ${commitSha.slice(0, 7)} | Transcript lines: ${transcriptLines.length}`,
             "",
-            "📤 Hasil Submit API make.fun (Asli):",
-            submitStatusLine,
+            "📤 Hasil Submit API make.fun (via OpenAPI):",
+            stepLogs.join("\n\n"),
             "",
             `⛽ ${gas}`
           ].join("\n");
@@ -365,3 +431,11 @@ jobs:
           await notify(finalReport);
           EOF
           node /tmp/build_and_submit.mjs
+
+      - name: Backup Session Transcript Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-session-transcript
+          path: /tmp/openclaw_session_backup.jsonl
+          if-no-files-found: ignore
