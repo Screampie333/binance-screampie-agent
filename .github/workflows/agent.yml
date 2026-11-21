@@ -17,29 +17,43 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           npm install -g @binance/agentic-wallet@1.12.0
 
-      - name: Start Linux Login & Send Real QR Image to Telegram
+      - name: Capture Real Login URL & Send QR Image to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BROWSER: echo
         run: |
+          # Tangkap URL yang dipanggil baw melalui xdg-open
+          sudo tee /usr/local/bin/xdg-open > /dev/null <<'EOF'
+          #!/bin/bash
+          echo "$1" > /tmp/captured_url.txt
+          EOF
+          sudo chmod +x /usr/local/bin/xdg-open
+
           script -q -f -c "baw auth signin" /tmp/signin.log > /dev/null 2>&1 &
           SIGNIN_PID=$!
 
           for i in $(seq 1 25); do
-            if grep -q "QR Code ID:" /tmp/signin.log 2>/dev/null; then
-              sleep 2
+            if [ -s /tmp/captured_url.txt ]; then
+              sleep 1
               break
             fi
             sleep 1
           done
 
+          REAL_URL=$(cat /tmp/captured_url.txt 2>/dev/null | tr -d '[:space:]')
           CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176')
-          REAL_URL=$(echo "$CLEAN_LOG" | grep -oE 'https://[^[:space:]]+' | head -n 1)
           PAIR_CODE=$(echo "$CLEAN_LOG" | grep -oE 'Pairing code:[[:space:]]*[a-zA-Z0-9]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
-          CAPTION_TXT=$(printf "🔑 SCAN QR INI DARI APLIKASI BINANCE (Pairing Code: %s)\nURL: %s" "$PAIR_CODE" "$REAL_URL")
+
+          if [ -z "$REAL_URL" ]; then
+            MSG_ERR=$(printf "❌ Gagal menangkap URL login. Log:\n%s" "$CLEAN_LOG")
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MSG_ERR}"
+            exit 1
+          fi
 
           qrencode -s 10 -o /tmp/qr.png "$REAL_URL"
+          CAPTION_TXT=$(printf "🔑 SCAN QR INI DARI APLIKASI BINANCE (Pairing Code: %s)\nURL: %s" "$PAIR_CODE" "$REAL_URL")
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
             -F chat_id="${TELEGRAM_CHAT_ID}" \
