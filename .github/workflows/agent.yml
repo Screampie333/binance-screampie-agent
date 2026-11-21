@@ -159,7 +159,7 @@ jobs:
           EOF
           node /tmp/select_bounty.mjs
 
-      - name: Build Code in OpenClaw Session, Push Repo & Submit via OpenAPI
+      - name: Build Code in OpenClaw Session, Push Repo & Submit via Recordings API
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -202,15 +202,15 @@ jobs:
             process.exit(0);
           }
 
-          // 1. Parse seluruh POST route & schema dari /api/openapi.json + SKILL.md
+          // 1. Ambil skema spesifik untuk build-key, recordings, chunks, finish, dan submissions dari /api/openapi.json
           const skillMd = fs.readFileSync(path.join(workspace, "skills", "makefun", "SKILL.md"), "utf8");
-          let allPostRoutes = [];
+          let submissionRoutes = {};
           try {
             const oaRes = await fetch("https://make.fun/api/openapi.json", { headers: { Accept: "application/json" } });
             if (oaRes.ok) {
               const oa = await oaRes.json();
               function resolveRef(node, depth = 0) {
-                if (!node || typeof node !== "object" || depth > 5) return node;
+                if (!node || typeof node !== "object" || depth > 6) return node;
                 if (node.$ref && typeof node.$ref === "string" && node.$ref.startsWith("#/")) {
                   const parts = node.$ref.slice(2).split("/");
                   let target = oa;
@@ -227,34 +227,32 @@ jobs:
               }
 
               for (const [routePath, methods] of Object.entries(oa.paths || {})) {
-                if (methods?.post) {
-                  const resolvedBody = resolveRef(methods.post.requestBody?.content?.["application/json"]?.schema || {});
-                  allPostRoutes.push({
-                    path: routePath,
-                    summary: methods.post.summary || "",
-                    bodySchema: resolvedBody
-                  });
+                if (/build-key|recordings|submissions/i.test(routePath)) {
+                  submissionRoutes[routePath] = {};
+                  for (const [m, spec] of Object.entries(methods || {})) {
+                    submissionRoutes[routePath][m] = {
+                      summary: spec.summary || "",
+                      requestBody: resolveRef(spec.requestBody?.content?.["application/json"]?.schema || null)
+                    };
+                  }
                 }
               }
             }
           } catch {}
 
           const extractionPrompt = [
-            `Analyze make.fun's OpenAPI POST routes and SKILL.md below for competition slug "${slug}".`,
-            "Determine:",
-            "1) \"preBuildSteps\": array of HTTP POST steps needed BEFORE creating/submitting the repo (for example registering/entering the competition if required by SKILL.md; otherwise []).",
-            "2) \"submitSteps\": array of HTTP POST steps needed to submit the repository, commit SHA, and AI session transcript.",
-            "Each step object in both arrays MUST have:",
-            "- \"url\": exact full URL starting with https://make.fun/api/... (replace path params like {slug} or {competitionSlug} with \"" + slug + "\", or {id}/{entryId} with \"__PREV_ID__\")",
+            `Using make.fun's OpenAPI schemas for build-key/recordings/submissions and SKILL.md below, build the exact sequence of HTTP POST requests to submit an entry for competition slug "${slug}".`,
+            "Return ONLY valid JSON with two arrays: \"preBuildSteps\" (e.g. build-key if needed before building, or []) and \"submitSteps\" (e.g. recordings -> chunks -> finish -> submissions).",
+            "Each step object MUST contain:",
+            "- \"url\": full https://make.fun/api/... URL with {slug} replaced by \"" + slug + "\" and {id} replaced by \"__RECORDING_ID__\"",
             "- \"method\": \"POST\"",
-            "- \"bodyTemplate\": JSON object matching the exact property names in bodySchema, using placeholders \"__REPO_URL__\", \"__COMMIT_SHA__\", \"__SLUG__\", \"__PREV_ID__\", \"__TRANSCRIPT_ARRAY__\", \"__TRANSCRIPT_STRING__\", \"__TRANSCRIPT_FILES__\".",
-            "Return ONLY valid JSON with keys \"preBuildSteps\" and \"submitSteps\".",
+            "- \"bodyTemplate\": JSON object matching the exact schema keys, using placeholders: \"__REPO_URL__\", \"__COMMIT_SHA__\", \"__SLUG__\", \"__BUILD_KEY__\", \"__RECORDING_ID__\", \"__TRANSCRIPT_ARRAY__\", \"__TRANSCRIPT_STRING__\", \"__TRANSCRIPT_FILES__\".",
             "",
-            "ALL OPENAPI POST ROUTES:",
-            JSON.stringify(allPostRoutes).slice(0, 16000),
+            "FILTERED OPENAPI SCHEMAS:",
+            JSON.stringify(submissionRoutes),
             "",
-            "SKILL.MD:",
-            skillMd.slice(0, 14000)
+            "FULL SKILL.MD:",
+            skillMd.slice(0, 24000)
           ].join("\n");
 
           let apiPlan = { preBuildSteps: [], submitSteps: [] };
@@ -296,6 +294,21 @@ jobs:
             } catch {}
           }
 
+          // Fallback deterministik jika LLM gagal memetakan
+          if (!apiPlan.submitSteps?.length) {
+            apiPlan = {
+              preBuildSteps: [
+                { url: `https://make.fun/api/competitions/${slug}/build-key`, method: "POST", bodyTemplate: {} }
+              ],
+              submitSteps: [
+                { url: `https://make.fun/api/competitions/${slug}/recordings`, method: "POST", bodyTemplate: {} },
+                { url: `https://make.fun/api/recordings/__RECORDING_ID__/chunks`, method: "POST", bodyTemplate: { lines: "__TRANSCRIPT_ARRAY__", content: "__TRANSCRIPT_STRING__" } },
+                { url: `https://make.fun/api/recordings/__RECORDING_ID__/finish`, method: "POST", bodyTemplate: {} },
+                { url: `https://make.fun/api/competitions/${slug}/submissions`, method: "POST", bodyTemplate: { repoUrl: "__REPO_URL__", commitSha: "__COMMIT_SHA__", recordingId: "__RECORDING_ID__" } }
+              ]
+            };
+          }
+
           function injectValues(obj, vars) {
             if (typeof obj === "string") {
               if (obj === "__TRANSCRIPT_ARRAY__") return vars.transcriptLines;
@@ -305,7 +318,8 @@ jobs:
                 .replaceAll("__REPO_URL__", vars.repoUrl || "")
                 .replaceAll("__COMMIT_SHA__", vars.commitSha || "")
                 .replaceAll("__SLUG__", slug)
-                .replaceAll("__PREV_ID__", vars.prevId || "");
+                .replaceAll("__BUILD_KEY__", vars.buildKey || "")
+                .replaceAll("__RECORDING_ID__", vars.recordingId || "");
             }
             if (Array.isArray(obj)) return obj.map(v => injectValues(v, vars));
             if (obj && typeof obj === "object") {
@@ -317,11 +331,12 @@ jobs:
           }
 
           const stepLogs = [];
-          let lastId = "";
+          let buildKey = "";
+          let recordingId = "";
 
           for (const st of (apiPlan.preBuildSteps || [])) {
-            const targetUrl = String(st.url || "").replaceAll("__PREV_ID__", lastId);
-            const payload = injectValues(st.bodyTemplate || {}, { prevId: lastId });
+            const targetUrl = String(st.url || "");
+            const payload = injectValues(st.bodyTemplate || {}, { buildKey, recordingId });
             try {
               const res = await fetch(targetUrl, {
                 method: "POST",
@@ -331,22 +346,23 @@ jobs:
               const txt = await res.text();
               try {
                 const parsedRes = JSON.parse(txt);
-                lastId = parsedRes?.id || parsedRes?.entry?.id || parsedRes?.submission?.id || parsedRes?.data?.id || lastId;
+                buildKey = parsedRes?.buildKey || parsedRes?.key || parsedRes?.token || parsedRes?.data?.buildKey || buildKey;
+                recordingId = parsedRes?.recordingId || parsedRes?.recording?.id || parsedRes?.id || recordingId;
               } catch {}
-              stepLogs.push(`Pre-step HTTP ${res.status} (${targetUrl}): ${txt.slice(0, 300)}`);
+              stepLogs.push(`Pre-step HTTP ${res.status} (${targetUrl}): ${txt.slice(0, 250)}`);
             } catch (err) {
               stepLogs.push(`Pre-step Error (${targetUrl}): ${err.message}`);
             }
           }
 
-          // 2. Jalankan OpenClaw dengan batas waktu ketat (maks 6 menit) agar tidak pernah di-cancel GitHub Actions
+          // 2. Jalankan OpenClaw untuk menulis kode & verifikasi kit (maks 6 menit)
           const workDir = `/tmp/work-${slug}`;
           fs.mkdirSync(workDir, { recursive: true });
           const sessionId = `makefun-${slug}-${Date.now()}`;
 
           const buildPrompt = [
             `Tugasmu membangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
-            "PENTING: Jangan jalankan simulasi/benchmark yang lambat (semua test wajib selesai di bawah 10 detik). JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
+            "PENTING: Semua test wajib selesai di bawah 10 detik. JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
             "Selesaikan dalam 6 putaran tool call singkat:",
             `1) Fetch detail/kit bounty "${slug}" dari https://make.fun/api/competitions/${slug} dan ekstrak ke "${workDir}".`,
             `2) Baca RULES.txt di "${workDir}" dan quote baris anchor di output tool pertama.`,
@@ -373,7 +389,7 @@ jobs:
             );
           } catch (err) {
             rawOpenclawOutput = (err.stdout || "").toString();
-            buildWarning = `⚠️ Catatan build (timeout/exit): ${(err.message || "").slice(0, 200)}`;
+            buildWarning = `⚠️ Catatan build: ${(err.message || "").slice(0, 200)}`;
           }
 
           const files = fs.readdirSync(workDir).filter(f => !f.startsWith("."));
@@ -412,66 +428,95 @@ jobs:
             process.exit(1);
           }
 
-          // 4. Kumpulkan transkrip sesi OpenClaw (.jsonl dari disk atau blok JSON bersih di stdout)
-          function findJsonlFiles(dir, results = []) {
+          // 4. Ekstrak seluruh baris sesi dari SQLite agent-db atau .jsonl di ~/.openclaw
+          function scanOpenclawFiles(dir, results = []) {
             if (!fs.existsSync(dir)) return results;
             for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
               const fullPath = path.join(dir, entry.name);
-              if (entry.isDirectory()) findJsonlFiles(fullPath, results);
-              else if (entry.name.endsWith(".jsonl")) {
-                results.push({ fullPath, size: fs.statSync(fullPath).size });
+              if (entry.isDirectory()) scanOpenclawFiles(fullPath, results);
+              else if (/\.(jsonl|db|sqlite|sqlite3)$/i.test(entry.name)) {
+                results.push({ fullPath, name: entry.name, size: fs.statSync(fullPath).size });
               }
             }
             return results;
           }
 
-          const allJsonl = findJsonlFiles(path.join(home, ".openclaw")).sort((a, b) => b.size - a.size);
-          let transcriptRaw = "";
+          const foundFiles = scanOpenclawFiles(path.join(home, ".openclaw"));
           let transcriptLines = [];
 
-          if (allJsonl.length > 0 && allJsonl[0].size > 0) {
-            transcriptRaw = fs.readFileSync(allJsonl[0].fullPath, "utf8");
-            transcriptLines = transcriptRaw.split("\n").filter(Boolean).map(line => {
-              try { return JSON.parse(line); } catch { return { raw: line }; }
-            });
-          } else {
+          // Cek file .jsonl jika ada
+          const jsonlFiles = foundFiles.filter(f => f.name.endsWith(".jsonl") && f.size > 0).sort((a, b) => b.size - a.size);
+          if (jsonlFiles.length > 0) {
+            const rawLines = fs.readFileSync(jsonlFiles[0].fullPath, "utf8").split("\n").filter(Boolean);
+            for (const line of rawLines) {
+              try { transcriptLines.push(JSON.parse(line)); } catch { transcriptLines.push({ raw: line }); }
+            }
+          }
+
+          // Jika kosong, baca dari SQLite database OpenClaw (agent-db) memakai node:sqlite
+          if (transcriptLines.length === 0) {
+            const dbFiles = foundFiles.filter(f => /\.(db|sqlite|sqlite3)$/i.test(f.name) && f.size > 0).sort((a, b) => b.size - a.size);
+            try {
+              const { DatabaseSync } = await import("node:sqlite");
+              for (const dbFile of dbFiles) {
+                const db = new DatabaseSync(dbFile.fullPath, { readOnly: true });
+                const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name);
+                for (const tbl of tables) {
+                  if (/message|turn|event|session|log|step/i.test(tbl)) {
+                    const rows = db.prepare(`SELECT * FROM "${tbl}" LIMIT 500`).all();
+                    for (const row of rows) {
+                      const enriched = { table: tbl };
+                      for (const [k, v] of Object.entries(row)) {
+                        if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+                          try { enriched[k] = JSON.parse(v); } catch { enriched[k] = v; }
+                        } else {
+                          enriched[k] = v;
+                        }
+                      }
+                      transcriptLines.push(enriched);
+                    }
+                  }
+                }
+                db.close();
+                if (transcriptLines.length > 0) break;
+              }
+            } catch {}
+          }
+
+          // Fallback terakhir jika SQLite kosong: baca stdout JSON OpenClaw
+          if (transcriptLines.length === 0) {
             const jsonStart = rawOpenclawOutput.indexOf("{");
             const jsonEnd = rawOpenclawOutput.lastIndexOf("}");
             if (jsonStart !== -1 && jsonEnd > jsonStart) {
               try {
                 const parsedOut = JSON.parse(rawOpenclawOutput.slice(jsonStart, jsonEnd + 1));
-                const events = [];
                 const nowIso = new Date().toISOString();
-                events.push({ type: "session_start", sessionId, timestamp: nowIso, model: "google/gemini-2.5-flash", workDir });
+                transcriptLines.push({ type: "session_start", sessionId, timestamp: nowIso, model: "google/gemini-2.5-flash" });
                 const payloads = parsedOut?.result?.payloads || parsedOut?.payloads || [];
-                const messages = parsedOut?.result?.messages || parsedOut?.messages || [];
-                if (Array.isArray(messages) && messages.length > 0) {
-                  for (const m of messages) events.push({ timestamp: nowIso, ...m });
-                } else {
-                  for (const p of payloads) events.push({ type: "assistant", timestamp: nowIso, ...p });
-                }
+                for (const p of payloads) transcriptLines.push({ type: "assistant", timestamp: nowIso, ...p });
                 if (parsedOut?.result?.usage || parsedOut?.usage) {
-                  events.push({ type: "usage", timestamp: nowIso, usage: parsedOut?.result?.usage || parsedOut?.usage });
+                  transcriptLines.push({ type: "usage", timestamp: nowIso, usage: parsedOut?.result?.usage || parsedOut?.usage });
                 }
-                transcriptLines = events;
-                transcriptRaw = events.map(e => JSON.stringify(e)).join("\n");
               } catch {}
             }
           }
 
+          const transcriptRaw = transcriptLines.map(e => JSON.stringify(e)).join("\n");
           if (transcriptRaw) {
             fs.writeFileSync("/tmp/openclaw_session_backup.jsonl", transcriptRaw);
           }
 
-          // 5. Kirim submission menggunakan route & schema hasil ekstraksi OpenAPI
+          // 5. Eksekusi rangkaian submitSteps (recordings -> chunks -> finish -> submissions)
           let anySubmitOk = false;
-          const submitSteps = apiPlan.submitSteps || [];
-          for (const st of submitSteps) {
-            const targetUrl = String(st.url || "").replaceAll("__PREV_ID__", lastId);
+          for (const st of (apiPlan.submitSteps || [])) {
+            const targetUrl = String(st.url || "")
+              .replaceAll("__RECORDING_ID__", recordingId)
+              .replaceAll("__BUILD_KEY__", buildKey);
             const payload = injectValues(st.bodyTemplate || {}, {
               repoUrl,
               commitSha,
-              prevId: lastId,
+              buildKey,
+              recordingId,
               transcriptLines,
               transcriptRaw
             });
@@ -486,19 +531,20 @@ jobs:
                 body: JSON.stringify(payload)
               });
               const txt = await res.text();
-              if (res.ok) anySubmitOk = true;
+              if (res.ok && /submissions/i.test(targetUrl)) anySubmitOk = true;
               try {
                 const parsedRes = JSON.parse(txt);
-                lastId = parsedRes?.id || parsedRes?.entry?.id || parsedRes?.submission?.id || parsedRes?.data?.id || lastId;
+                buildKey = parsedRes?.buildKey || parsedRes?.key || parsedRes?.data?.buildKey || buildKey;
+                recordingId = parsedRes?.recordingId || parsedRes?.recording?.id || parsedRes?.id || recordingId;
               } catch {}
-              stepLogs.push(`HTTP ${res.status} (${targetUrl}):\n${txt.slice(0, 700)}`);
+              stepLogs.push(`HTTP ${res.status} (${targetUrl}):\n${txt.slice(0, 500)}`);
             } catch (err) {
               stepLogs.push(`Error (${targetUrl}): ${err.message}`);
             }
           }
 
-          const availableRoutesNote = (!anySubmitOk && allPostRoutes.length > 0)
-            ? `\n\n📌 Daftar POST routes resmi di /api/openapi.json:\n${allPostRoutes.map(r => `- ${r.path}`).join("\n")}`
+          const schemaDebugNote = !anySubmitOk
+            ? `\n\n🧩 Skema Submit OpenAPI:\n${JSON.stringify(submissionRoutes).slice(0, 1200)}`
             : "";
 
           const finalReport = [
@@ -508,7 +554,7 @@ jobs:
             buildWarning,
             "",
             "📤 Hasil Submit API make.fun:",
-            (stepLogs.join("\n\n") || "Tidak ada step submit yang dieksekusi.") + availableRoutesNote,
+            (stepLogs.join("\n\n") || "Tidak ada step submit yang dieksekusi.") + schemaDebugNote,
             "",
             `⛽ ${gas}`
           ].filter(Boolean).join("\n");
