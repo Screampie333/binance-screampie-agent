@@ -2,9 +2,10 @@ name: Binance Agent 24/7 Worker
 
 on:
   schedule:
-    # Jalan otomatis setiap 15 menit (24/7)
     - cron: '*/15 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [telegram-command]
 
 jobs:
   run-agent:
@@ -27,8 +28,6 @@ jobs:
           export PATH="$HOME/.npm-global/bin:$PATH"
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           npm install -g @binance/agentic-wallet@1.12.0 openclaw@latest
-          baw --version
-          openclaw --version
 
       - name: Restore Binance Wallet Session
         env:
@@ -47,14 +46,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           mkdir -p "$HOME/.openclaw/workspace"
-
-          # Inisialisasi dasar OpenClaw
           openclaw onboard --non-interactive --accept-risk \
             --auth-choice groq-api-key \
             --groq-api-key "$GROQ_API_KEY" \
             --skip-channels --skip-skills --skip-daemon || true
 
-          # Daftarkan model Gemini aktif dari akun kamu (ringan, cepat, bebas limit)
           openclaw config set agents.defaults.models '{"google/gemini-3.1-flash-lite":{},"google/gemini-3.5-flash-lite":{},"google/gemini-3.7-flash":{},"google/gemini-3.8-flash":{}}' --strict-json --merge || true
           openclaw models set google/gemini-3.1-flash-lite || true
           openclaw models fallbacks add google/gemini-3.5-flash-lite || true
@@ -69,7 +65,6 @@ jobs:
           EOF
           chmod 600 "$HOME/.openclaw/.env"
 
-          # Install 3 skill inti & ganti symlink jadi folder fisik
           cd "$HOME/.openclaw/workspace"
           npx -y skills add binance/binance-skills-hub/skills/binance-web3 --all --agent '*' -y
           rm -rf "$HOME/.openclaw/workspace/skills"
@@ -79,25 +74,25 @@ jobs:
           done
           rm -rf "$HOME/.openclaw/workspace/.agents"
 
-          openclaw models status
-
       - name: Execute Agent Cycle & Notify Telegram
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          USER_CMD: ${{ github.event.client_payload.command }}
         run: |
           cd "$HOME/.openclaw/workspace"
-          RESULT=$(openclaw agent --local --message "Periksa status wallet & sisa gas menggunakan baw CLI, lalu cek peluang terbaru untuk Free Mint (NFT & Token), Klaim khusus pemegang Agent ID, dan Kampanye Tugas Agent. Ikuti aturan ketat di AGENTS.md. Buat ringkasan singkat (maksimal 1500 karakter) hasil pengecekanmu.")
-          echo "=== HASIL AGENT ==="
-          echo "$RESULT"
-          
-          MSG="${RESULT:-⚠️ Agent selesai berjalan tetapi tidak menghasilkan teks output.}"
+          if [ -n "$USER_CMD" ]; then
+            PROMPT="Perintah langsung dari user di Telegram: \"${USER_CMD}\". Eksekusi atau jawab sesuai aturan ketat di AGENTS.md menggunakan baw CLI dan skill yang tersedia. Buat ringkasan singkat (maksimal 1500 karakter)."
+          else
+            PROMPT="Periksa status wallet & sisa gas menggunakan baw CLI, lalu cek peluang terbaru untuk Free Mint (NFT & Token), Klaim khusus pemegang Agent ID, dan Kampanye Tugas Agent. Ikuti aturan ketat di AGENTS.md. Buat ringkasan singkat (maksimal 1500 karakter) hasil pengecekanmu."
+          fi
+
+          RESULT=$(openclaw agent --local --message "$PROMPT")
+          MSG="${RESULT:-⚠️ Agent selesai berjalan tanpa output teks.}"
           MSG="${MSG:0:3800}"
-          
-          TG_RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MSG}")
-          echo "=== RESPON TELEGRAM ==="
-          echo "$TG_RESP"
+            --data-urlencode "text=${MSG}"
