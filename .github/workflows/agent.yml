@@ -17,36 +17,45 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           npm install -g @binance/agentic-wallet@1.12.0
 
-      - name: Extract Real Login URL & Send QR Image to Telegram
+      - name: Intercept Real Browser URL & Send QR Image to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Ekstrak template URL login web asli dari kode sumber baw CLI
-          PKG_DIR="$HOME/.npm-global/lib/node_modules/@binance/agentic-wallet"
-          URL_TMPL=$(grep -rhoE 'https://[a-zA-Z0-9./_-]*qrCodeId=[a-zA-Z0-9${}_-]+' "$PKG_DIR" | head -n 1 || true)
-          [ -z "$URL_TMPL" ] && URL_TMPL=$(grep -rhoE 'https://www\.binance\.com/[^"'\''` ]+' "$PKG_DIR" | grep -iE 'qr|login|agentic|wallet' | head -n 1 || true)
+          # Hook child_process Node.js untuk menangkap argumen URL asli yang dibuka baw CLI
+          cat <<'EOF' > /tmp/hook.js
+          const fs = require('fs');
+          const cp = require('child_process');
+          const origSpawn = cp.spawn;
+          cp.spawn = function(cmd, args, opts) {
+            const all = [cmd, ...(args || [])].join(' ');
+            const match = all.match(/https?:\/\/[^\s'"]+/);
+            if (match) fs.writeFileSync('/tmp/captured_url.txt', match[0]);
+            return origSpawn.apply(this, arguments);
+          };
+          EOF
 
-          script -q -f -c "baw auth signin" /tmp/signin.log > /dev/null 2>&1 &
+          NODE_OPTIONS="--require /tmp/hook.js" script -q -f -c "baw auth signin" /tmp/signin.log > /dev/null 2>&1 &
           SIGNIN_PID=$!
 
           for i in $(seq 1 25); do
-            if grep -q "QR Code ID:" /tmp/signin.log 2>/dev/null; then
+            if [ -s /tmp/captured_url.txt ]; then
               sleep 1
               break
             fi
             sleep 1
           done
 
+          REAL_URL=$(cat /tmp/captured_url.txt 2>/dev/null | tr -d '[:space:]')
           CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176')
-          QR_ID=$(echo "$CLEAN_LOG" | grep -oE 'QR Code ID:[[:space:]]*[a-zA-Z0-9-]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
           PAIR_CODE=$(echo "$CLEAN_LOG" | grep -oE 'Pairing code:[[:space:]]*[a-zA-Z0-9]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
 
-          if [ -n "$URL_TMPL" ]; then
-            REAL_URL=$(echo "$URL_TMPL" | sed -E "s/\\\$\{[^}]+\}/${QR_ID}/g")
-            [[ "$REAL_URL" != *"$QR_ID"* ]] && REAL_URL="${REAL_URL}${QR_ID}"
-          else
-            REAL_URL="https://www.binance.com/en/web3wallet/agentic-login?qrCodeId=${QR_ID}"
+          if [ -z "$REAL_URL" ]; then
+            MSG_ERR=$(printf "❌ URL belum tertangkap. Log:\n%s" "$CLEAN_LOG")
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MSG_ERR}"
+            exit 1
           fi
 
           qrencode -s 10 -o /tmp/qr.png "$REAL_URL"
