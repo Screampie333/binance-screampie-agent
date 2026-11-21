@@ -14,12 +14,40 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install makefun CLI
+      - name: Locate & Install makefun CLI
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          mkdir -p "$HOME/.npm-global"
+          mkdir -p "$HOME/.npm-global/bin"
           npm config set prefix "$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
-          npm install -g makefun || npm install -g @makefun/cli || true
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          # 1. Cek installer resmi dari make.fun jika tersedia
+          INSTALL_SH=$(curl -fsSL "https://make.fun/install.sh" 2>/dev/null || true)
+          if echo "$INSTALL_SH" | grep -qE '#!/bin/(ba)?sh'; then
+            echo "$INSTALL_SH" | bash || true
+          fi
+
+          # 2. Cek alternatif nama paket npm jika binary makefun belum ada
+          if ! command -v makefun >/dev/null 2>&1; then
+            for pkg in "@make-fun/cli" "makefun-cli" "@makefun/agent" "makefun-agent"; do
+              npm install -g "$pkg" >/dev/null 2>&1 && break || true
+            done
+          fi
+
+          # 3. Jika binary makefun tetap belum ditemukan, ambil skill.md / llms.txt dari make.fun
+          if ! command -v makefun >/dev/null 2>&1; then
+            SKILL_INFO=$(curl -fsSL "https://make.fun/skill.md" 2>/dev/null || curl -fsSL "https://make.fun/llms.txt" 2>/dev/null || true)
+            SNIPPET=$(echo "$SKILL_INFO" | head -c 3000)
+            MSG_INFO=$(printf "⚠️ Binary makefun CLI tidak ditemukan di npm.\n\nIsi make.fun/skill.md:\n%s" "${SNIPPET:-Tidak ada response dari skill.md}")
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MSG_INFO}"
+            exit 1
+          fi
 
       - name: Run makefun login & Send Approval Link to Telegram
         env:
@@ -38,8 +66,7 @@ jobs:
           };
           EOF
 
-          CMD_BIN=$(command -v makefun || echo "npx -y makefun")
-          NODE_OPTIONS="--require /tmp/hook.js" script -q -f -c "$CMD_BIN login" /tmp/makefun_login.log > /dev/null 2>&1 &
+          NODE_OPTIONS="--require /tmp/hook.js" script -q -f -c "makefun login" /tmp/makefun_login.log > /dev/null 2>&1 &
           LOGIN_PID=$!
 
           for i in $(seq 1 25); do
@@ -77,9 +104,4 @@ jobs:
           B64_STR=$(base64 -w 0 /tmp/makefun_session.tar.gz)
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=✅ COPY STRING BASE64 DI BAWAH INI KE SECRET MAKEFUN_SESSION_B64:"
-
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${B64_STR}"
+            -d chat_
