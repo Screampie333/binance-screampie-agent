@@ -27,6 +27,7 @@ jobs:
         run: |
           git config --global user.name "Screampie333"
           git config --global user.email "screampie333@users.noreply.github.com"
+          git config --global init.defaultBranch main
           if [ -n "$GH_PAT" ]; then
             git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
           fi
@@ -51,10 +52,10 @@ jobs:
             --skip-channels --skip-skills --skip-daemon || true
 
           openclaw config set tools.profile full || true
-          openclaw config set agents.defaults.models '{"google/gemini-3.1-flash-lite":{},"groq/llama-3.3-70b-versatile":{},"google/gemini-3.5-flash-lite":{}}' --strict-json --merge || true
-          openclaw models set google/gemini-3.1-flash-lite || true
+          openclaw config set agents.defaults.models '{"google/gemini-2.5-flash":{},"google/gemini-3.1-flash-lite":{},"groq/llama-3.3-70b-versatile":{}}' --strict-json --merge || true
+          openclaw models set google/gemini-2.5-flash || true
+          openclaw models fallbacks add google/gemini-3.1-flash-lite || true
           openclaw models fallbacks add groq/llama-3.3-70b-versatile || true
-          openclaw models fallbacks add google/gemini-3.5-flash-lite || true
 
           cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
           printf "GEMINI_API_KEY=%s\nGROQ_API_KEY=%s\nTELEGRAM_BOT_TOKEN=%s\nMAKEFUN_API_KEY=%s\n" \
@@ -138,7 +139,7 @@ jobs:
           let existingRepos = "Belum ada repo makefun.";
           try {
             if (process.env.GH_TOKEN) {
-              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "100", "--json", "name,url,createdAt"], { encoding: "utf8" });
+              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "100", "--json", "name,url,pushedAt"], { encoding: "utf8" });
               existingRepos = out.trim() || existingRepos;
             }
           } catch {}
@@ -166,7 +167,7 @@ jobs:
           EOF
           node /tmp/fetch_feeds.mjs
 
-      - name: Execute Full Autopilot Builder & Notify Telegram
+      - name: Execute Full Autopilot Builder & Verify Real Output
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -210,17 +211,18 @@ jobs:
             ? [
                 `Perintah langsung dari owner: "${cmd}".`,
                 baseContext,
-                "Jalankan dalam mode FULL AUTOPILOT sesuai AGENTS.md dan skills/makefun/SKILL.md tanpa meminta konfirmasi. Tulis laporan ringkas maksimal 1800 karakter."
+                "Jalankan sesuai AGENTS.md dan skills/makefun/SKILL.md. Jangan pernah mengarang status sukses atau Submission ID jika tool/push gagal. Tulis laporan ringkas maksimal 1600 karakter."
               ].join("\n")
             : [
-                "MODE FULL AUTOPILOT AKTIF. Jangan meminta konfirmasi atau melaporkan bounty yang di-skip.",
+                "MODE FULL AUTOPILOT AKTIF. DILARANG mengarang hasil atau Submission ID.",
                 baseContext,
-                "Instruksi eksekusi langsung:",
-                "1) Baca AGENTS.md dan skills/makefun/SKILL.md.",
-                "2) Periksa kandidat bounty GRATIS ($0) di atas yang BELUM ada di daftar repo Screampie333. Cek GET https://make.fun/api/competitions/<slug>/requirements untuk setiap kandidat. Lewati otomatis semua bounty yang punya human-only steps (X/YouTube/Roblox/aksi manual).",
-                "3) Pilih 1 bounty terbaik yang 100% pure-code/otomatis dan LANGSUNG kerjakan sampai tuntas: unduh kit, baca RULES.txt, quote anchor line di tool result pertama, tulis kode dengan tools di sesi ini (>=30% authored lines), jalankan check kit sampai lulus 100%, buat repo publik baru di Screampie333 (topic: makefun) dan push, bundel transcript sesi dari ~/.openclaw/agents/main/sessions/, submit via API make.fun dengan header x-api-key, lalu poll status sampai terbaca scored.",
-                "4) Cek entry lama yang sudah scored: kirim claim code (rahasia) jika menang, atau jalankan post-mortem leaderboard jika kalah.",
-                "5) Tulis laporan ringkas hanya untuk pekerjaan yang dieksekusi & hasil submission ke Telegram owner maksimal 1800 karakter."
+                "Langkah wajib yang harus benar-benar dieksekusi dengan tools:",
+                "1) Baca AGENTS.md dan skills/makefun/SKILL.md secara lengkap.",
+                "2) Pilih 1 bounty GRATIS ($0) berstatus open yang belum ada di daftar repo Screampie333 dan lolos cek GET https://make.fun/api/competitions/<slug>/requirements (tanpa human-only steps).",
+                "3) Buat folder proyek di /tmp/work-<slug>, unduh kit bounty, baca RULES.txt, quote anchor line di tool result pertama, tulis seluruh kode proyek menggunakan tools di sesi ini (>=30% authored lines), dan jalankan check kit sampai lulus.",
+                "4) Inisialisasi git, commit semua file, buat repo publik baru di Screampie333 (gh repo create Screampie333/makefun-<slug> --public --source=. --remote=origin --push), lalu tambah topic makefun (gh repo edit Screampie333/makefun-<slug> --add-topic makefun).",
+                "5) Bundel transcript sesi dari ~/.openclaw/agents/main/sessions/*.jsonl sesuai spesifikasi di skills/makefun/SKILL.md, submit ke endpoint API make.fun memakai header x-api-key: $MAKEFUN_API_KEY, dan laporkan respons JSON asli dari server.",
+                "6) Tulis laporan jujur & ringkas maksimal 1500 karakter."
               ].join("\n");
 
           let cleanMsg = "";
@@ -237,17 +239,37 @@ jobs:
               cleanMsg = data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
             }
           } catch (err) {
-            cleanMsg = `⚠️ Siklus autopilot selesai dengan catatan: ${(err.message || "").slice(0, 400)}`;
+            cleanMsg = `⚠️ Siklus autopilot berhenti dengan error: ${(err.message || "").slice(0, 400)}`;
           }
 
-          const msg = (cleanMsg || `⛽ Gas Fee: ${gas}`).slice(0, 3800);
+          // Audit nyata langsung ke GitHub API agar tidak tertipu halusinasi agent
+          let auditSummary = "Belum ada repo baru dengan topic makefun.";
+          try {
+            if (process.env.GH_TOKEN) {
+              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "10", "--json", "name,url,pushedAt"], { encoding: "utf8" });
+              const list = JSON.parse(out || "[]");
+              if (list.length > 0) {
+                auditSummary = list.map(r => `- ${r.name}: ${r.pushedAt ? `✅ Ter-push (${r.pushedAt})` : "❌ KOSONG (belum ada commit)"}`).join("\n");
+              }
+            }
+          } catch {}
+
+          const finalReport = [
+            cleanMsg || "⚠️ Tidak ada output teks dari agent.",
+            "",
+            "🔍 Audit Repo GitHub (Asli):",
+            auditSummary,
+            "",
+            `⛽ ${gas}`
+          ].join("\n").slice(0, 3800);
+
           const botToken = process.env.TELEGRAM_BOT_TOKEN;
           const chatId = process.env.TELEGRAM_CHAT_ID;
 
           await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: msg })
+            body: JSON.stringify({ chat_id: chatId, text: finalReport })
           });
           EOF
           node /tmp/run_agent.mjs
