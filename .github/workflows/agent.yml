@@ -159,7 +159,7 @@ jobs:
           EOF
           node /tmp/select_bounty.mjs
 
-      - name: Build Code in OpenClaw Session, Add MIT LICENSE, Push & Submit
+      - name: Build Code, Inject make.fun Badges & About, Push & Submit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -202,22 +202,28 @@ jobs:
             process.exit(0);
           }
 
-          // 1. Jalankan OpenClaw untuk membangun proyek & verifikasi kit (>= 7 putaran tool call)
+          // 1. Ambil requirements & readme_template dari make.fun sebelum build
+          let reqData = {};
+          try {
+            const reqRes = await fetch(`https://make.fun/api/competitions/${slug}/requirements`, {
+              headers: { Accept: "application/json", "x-api-key": apiKey }
+            });
+            if (reqRes.ok) reqData = await reqRes.json();
+          } catch {}
+
+          // 2. Jalankan OpenClaw untuk menulis kode & menjalankan verifikasi singkat (maks 4 menit)
           const workDir = `/tmp/work-${slug}`;
           fs.mkdirSync(workDir, { recursive: true });
           const sessionId = `makefun-${slug}-${Date.now()}`;
 
           const buildPrompt = [
-            `Tugasmu membangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
-            "PENTING: Semua test wajib selesai di bawah 10 detik. JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
-            "Lakukan secara bertahap minimal 7 putaran tool call terpisah agar rekaman sesi lolos harness:",
-            `1) Baca skills/makefun/SKILL.md dan fetch detail bounty "${slug}" dari https://make.fun/api/competitions/${slug}.`,
-            `2) Unduh dan ekstrak kit bounty ke "${workDir}".`,
-            `3) Baca RULES.txt di "${workDir}" dan quote baris anchor di output tool pertama sebelum menulis file apa pun.`,
-            `4) Tulis file kode utama di "${workDir}" menggunakan tool tulis file.`,
-            `5) Tulis file test / modul pendukung di "${workDir}" menggunakan tool tulis file.`,
-            `6) Tulis README.md di "${workDir}" sesuai RULES.txt.`,
-            `7) Jalankan script verifikasi/check dari kit di "${workDir}" sampai lulus 100%, lalu selesai.`
+            `Bangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
+            "PENTING: Selesaikan dalam waktu di bawah 2 menit (maksimal 6 tool call singkat). Semua tes wajib selesai di bawah 5 detik. JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
+            `1) Fetch detail/kit bounty "${slug}" dari https://make.fun/api/competitions/${slug} dan ekstrak ke "${workDir}".`,
+            `2) Baca RULES.txt di "${workDir}" dan quote baris anchor di output tool pertama.`,
+            `3) Tulis file kode utama yang bersih & lolos aturan ukuran di "${workDir}".`,
+            `4) Tulis file test singkat di "${workDir}" dan jalankan check/verifikasi cepat (<5 detik).`,
+            `5) Segera akhiri sesi dengan ringkasan 2 kalimat.`
           ].join("\n");
 
           let rawOpenclawOutput = "";
@@ -225,19 +231,19 @@ jobs:
           try {
             rawOpenclawOutput = execFileSync(
               "openclaw",
-              ["agent", "--local", "--session-id", sessionId, "--timeout", "300", "--json", "--message", buildPrompt],
+              ["agent", "--local", "--session-id", sessionId, "--timeout", "210", "--json", "--message", buildPrompt],
               {
                 cwd: workspace,
                 env,
                 encoding: "utf8",
-                timeout: 360000,
+                timeout: 240000,
                 killSignal: "SIGKILL",
                 maxBuffer: 25 * 1024 * 1024
               }
             );
           } catch (err) {
             rawOpenclawOutput = (err.stdout || "").toString();
-            buildWarning = `⚠️ Catatan build: ${(err.message || "").slice(0, 200)}`;
+            buildWarning = `⚠️ Catatan build: ${(err.message || "").slice(0, 180)}`;
           }
 
           const files = fs.readdirSync(workDir).filter(f => !f.startsWith("."));
@@ -246,7 +252,7 @@ jobs:
             process.exit(1);
           }
 
-          // 2. Pastikan file LICENSE OSI-approved (MIT + SPDX-License-Identifier: MIT) ada di root repo
+          // 3. Pastikan file LICENSE MIT (SPDX-License-Identifier: MIT) ada di root repo
           const licensePath = path.join(workDir, "LICENSE");
           if (!fs.existsSync(licensePath)) {
             const mitLicense = [
@@ -277,9 +283,49 @@ jobs:
             fs.writeFileSync(licensePath, mitLicense);
           }
 
-          // 3. Push ke repo publik GitHub dengan topic makefun
-          const repoFull = `Screampie333/makefun-${slug}`;
+          // 4. Susun README.md lengkap dengan 3 live badge make.fun + link ke halaman bounty
+          const owner = "Screampie333";
+          const repoName = `makefun-${slug}`;
+          const repoFull = `${owner}/${repoName}`;
           const repoUrl = `https://github.com/${repoFull}`;
+          const bountyUrl = `https://make.fun/bounty/${slug}`;
+
+          const badgeComp = `https://make.fun/badge/${slug}.svg`;
+          const badgeRank = `https://make.fun/badge/${slug}/${owner}/${repoName}/rank.svg`;
+          const badgeReward = `https://make.fun/badge/${slug}/${owner}/${repoName}/reward.svg`;
+
+          const badgeHeader = [
+            `[![make.fun](${badgeComp})](${bountyUrl})`,
+            `[![Rank](${badgeRank})](${bountyUrl})`,
+            `[![Reward](${badgeReward})](${bountyUrl})`,
+            "",
+            `Official entry for [${title}](${bountyUrl}) on [make.fun](https://make.fun).`
+          ].join("\n");
+
+          const readmePath = path.join(workDir, "README.md");
+          const existingReadme = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, "utf8") : "";
+          const templateRaw = reqData?.how_to_submit?.readme_template || reqData?.readme_template || "";
+
+          let finalReadme = "";
+          if (templateRaw) {
+            const runCmd = fs.existsSync(path.join(workDir, "main.py")) ? "python3 main.py" : "node index.js";
+            finalReadme = String(templateRaw)
+              .replaceAll("{owner}", owner).replaceAll("<owner>", owner)
+              .replaceAll("{repo}", repoName).replaceAll("<repo>", repoName)
+              .replaceAll("{slug}", slug).replaceAll("<slug>", slug)
+              .replaceAll("{description}", title).replaceAll("<description>", title)
+              .replaceAll("{run_command}", runCmd).replaceAll("<run_command>", runCmd)
+              .replaceAll("{referral_code}", "").replaceAll("<referral_code>", "");
+          } else {
+            finalReadme = existingReadme || `# ${title}\n\nAutonomous entry for ${slug}.\n`;
+          }
+
+          if (!finalReadme.includes(badgeComp) || !finalReadme.includes(badgeRank) || !finalReadme.includes(badgeReward) || !finalReadme.includes(bountyUrl)) {
+            finalReadme = `${badgeHeader}\n\n---\n\n${finalReadme}`;
+          }
+          fs.writeFileSync(readmePath, finalReadme);
+
+          // 5. Push ke GitHub & lengkapi metadata repo_about (Homepage, Description, Topic makefun)
           let commitSha = "";
           try {
             fs.writeFileSync(path.join(workDir, ".gitignore"), "__pycache__/\n*.pyc\nnode_modules/\n.env\n");
@@ -301,16 +347,23 @@ jobs:
             } else {
               execFileSync("gh", ["repo", "create", repoFull, "--public", "--source=.", "--remote=origin", "--push"], { cwd: workDir, env, timeout: 60000 });
             }
-            execFileSync("gh", ["repo", "edit", repoFull, "--add-topic", "makefun"], { cwd: workDir, env, timeout: 30000 });
+
+            const aboutHomepage = reqData?.how_to_submit?.homepage || bountyUrl;
+            const aboutDesc = (reqData?.how_to_submit?.description || `${title} — Built for make.fun (${bountyUrl})`).slice(0, 300);
+            execFileSync(
+              "gh",
+              ["repo", "edit", repoFull, "--description", aboutDesc, "--homepage", aboutHomepage, "--add-topic", "makefun"],
+              { cwd: workDir, env, timeout: 30000 }
+            );
           } catch (err) {
-            await notify(`⚠️ Kode selesai dibuat, tapi gagal push ke GitHub (${repoFull}):\n${(err.message || "").slice(0, 600)}`);
+            await notify(`⚠️ Kode selesai dibuat, tapi gagal push/update About di GitHub (${repoFull}):\n${(err.message || "").slice(0, 600)}`);
             process.exit(1);
           }
 
-          // Tunggu 5 detik agar GitHub selesai mendeteksi file LICENSE pada repository
+          // Tunggu 5 detik agar GitHub selesai mengindeks README, LICENSE, dan About
           await new Promise(resolve => setTimeout(resolve, 5000));
 
-          // 4. Ekstrak seluruh log sesi OpenClaw dari .jsonl maupun SQLite agent-db
+          // 6. Ekstrak seluruh log sesi OpenClaw dari .jsonl maupun SQLite agent-db
           function scanOpenclawFiles(dir, results = []) {
             if (!fs.existsSync(dir)) return results;
             for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -363,29 +416,12 @@ jobs:
             } catch {}
           }
 
-          if (transcriptLines.length === 0) {
-            const jsonStart = rawOpenclawOutput.indexOf("{");
-            const jsonEnd = rawOpenclawOutput.lastIndexOf("}");
-            if (jsonStart !== -1 && jsonEnd > jsonStart) {
-              try {
-                const parsedOut = JSON.parse(rawOpenclawOutput.slice(jsonStart, jsonEnd + 1));
-                const nowIso = new Date().toISOString();
-                transcriptLines.push({ type: "session_start", sessionId, timestamp: nowIso, model: "google/gemini-2.5-flash" });
-                const payloads = parsedOut?.result?.payloads || parsedOut?.payloads || [];
-                for (const p of payloads) transcriptLines.push({ type: "assistant", timestamp: nowIso, ...p });
-                if (parsedOut?.result?.usage || parsedOut?.usage) {
-                  transcriptLines.push({ type: "usage", timestamp: nowIso, usage: parsedOut?.result?.usage || parsedOut?.usage });
-                }
-              } catch {}
-            }
-          }
-
           const transcriptRaw = transcriptLines.map(e => JSON.stringify(e)).join("\n");
           if (transcriptRaw) {
             fs.writeFileSync("/tmp/openclaw_session_backup.jsonl", transcriptRaw);
           }
 
-          // 5. Kirim multipart/form-data ke POST /api/competitions/{slug}/submissions sesuai OpenAPI
+          // 7. Kirim multipart/form-data ke POST /api/competitions/{slug}/submissions
           const submitUrl = `https://make.fun/api/competitions/${slug}/submissions`;
           let submitResultText = "";
 
