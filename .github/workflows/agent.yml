@@ -167,7 +167,7 @@ jobs:
           EOF
           node /tmp/fetch_feeds.mjs
 
-      - name: Execute Full Autopilot Builder & Verify Real Output
+      - name: Execute Full Autopilot Builder & Submit to make.fun
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -180,6 +180,7 @@ jobs:
         run: |
           cat <<'EOF' > /tmp/run_agent.mjs
           import { execFileSync } from "node:child_process";
+          import fs from "node:fs";
           import os from "node:os";
           import path from "node:path";
 
@@ -195,6 +196,19 @@ jobs:
           const mf = process.env.MAKEFUN_FEED || "";
           const repos = process.env.EXISTING_REPOS || "";
           const dc = process.env.DISCORD_FEED || "";
+
+          function runOpenclaw(message) {
+            const raw = execFileSync("openclaw", ["agent", "--local", "--json", "--message", message], {
+              cwd: workspace,
+              env,
+              encoding: "utf8",
+              maxBuffer: 20 * 1024 * 1024
+            });
+            const start = raw.indexOf("{");
+            if (start === -1) return "";
+            const data = JSON.parse(raw.slice(start));
+            return data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
+          }
 
           const baseContext = [
             `Gas saat ini: ${gas}`,
@@ -212,58 +226,86 @@ jobs:
             ? [
                 `Perintah langsung dari owner: "${cmd}".`,
                 baseContext,
-                "Jalankan sesuai AGENTS.md dan skills/makefun/SKILL.md. Gunakan file transcript .jsonl asli milik OpenClaw di ~/.openclaw/agents/main/sessions/ (JANGAN buat transcript manual) dan lakukan minimal 6 putaran tool call. Tulis laporan ringkas maksimal 1600 karakter."
+                "Jalankan sesuai AGENTS.md dan skills/makefun/SKILL.md sampai benar-benar ter-submit ke API make.fun dan menampilkan submissionId asli. Tulis laporan ringkas maksimal 1600 karakter."
               ].join("\n")
             : [
-                "MODE FULL AUTOPILOT AKTIF. Kamu adalah OpenClaw dan sesi ini SUDAH otomatis merekam log .jsonl asli beserta timestamp dan token usage di ~/.openclaw/agents/main/sessions/.",
+                "MODE FULL AUTOPILOT AKTIF. Tugasmu BELUM selesai sebelum memanggil endpoint POST submit di API make.fun dan mendapatkan submissionId asli.",
                 baseContext,
-                "Instruksi wajib (lakukan secara bertahap minimal 7 putaran tool call agar lolos thinking_turns >= 5, thinking_reproduces, dan thinking_priced):",
-                "1) Baca AGENTS.md dan skills/makefun/SKILL.md secara lengkap.",
-                "2) Pilih 1 bounty GRATIS ($0) berstatus open (seperti tiny-chess-01 jika belum ada di daftar repo) dan cek GET https://make.fun/api/competitions/<slug>/requirements.",
+                "Instruksi wajib (lakukan secara bertahap minimal 8 putaran tool call):",
+                "1) Baca seluruh isi skills/makefun/SKILL.md sampai habis (terutama endpoint & payload POST submission).",
+                "2) Pilih 1 bounty GRATIS ($0) berstatus open yang belum ada di daftar repo Screampie333 dan cek GET https://make.fun/api/competitions/<slug>/requirements.",
                 "3) Unduh kit bounty ke /tmp/work-<slug>, baca RULES.txt, dan quote baris anchor di output tool pertama sebelum menulis file apa pun.",
-                "4) Tulis kode proyek secara bertahap dalam beberapa turn terpisah (file utama, file modul/test, dan README.md) menggunakan tool tulis file di sesi aktif ini (>=30% authored lines).",
+                "4) Tulis kode proyek secara bertahap dalam beberapa turn terpisah (kode utama, test/modul, README.md) menggunakan tool tulis file di sesi ini (>=30% authored lines).",
                 "5) Jalankan script check dari kit hingga lulus 100%.",
                 "6) Inisialisasi git, commit semua file, buat repo publik baru (gh repo create Screampie333/makefun-<slug> --public --source=. --remote=origin --push), dan tambah topic makefun (gh repo edit Screampie333/makefun-<slug> --add-topic makefun).",
-                "7) Ambil file .jsonl asli terbaru dari ~/.openclaw/agents/main/sessions/ (DILARANG membuat/mengedit file transcript manual), bundel sesuai spesifikasi skills/makefun/SKILL.md, submit ke API make.fun dengan header x-api-key: $MAKEFUN_API_KEY, dan laporkan respons JSON aslinya.",
-                "8) Tulis laporan jujur & ringkas maksimal 1500 karakter."
+                "7) WAJIB EKSEKUSI SUBMIT API: Ambil file .jsonl asli terbaru dari ~/.openclaw/agents/main/sessions/ (DILARANG mengedit/membuat manual), bundel sesuai instruksi di skills/makefun/SKILL.md, jalankan request POST submission ke https://make.fun/api/... dengan header x-api-key: $MAKEFUN_API_KEY, lalu poll status submission tersebut.",
+                "8) Laporkan URL repo GitHub, submissionId asli, dan status submission dari server make.fun (maksimal 1500 karakter)."
               ].join("\n");
 
           let cleanMsg = "";
           try {
-            const raw = execFileSync("openclaw", ["agent", "--local", "--json", "--message", prompt], {
-              cwd: workspace,
-              env,
-              encoding: "utf8",
-              maxBuffer: 20 * 1024 * 1024
-            });
-            const start = raw.indexOf("{");
-            if (start !== -1) {
-              const data = JSON.parse(raw.slice(start));
-              cleanMsg = data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
-            }
+            cleanMsg = runOpenclaw(prompt);
           } catch (err) {
             cleanMsg = `⚠️ Siklus autopilot berhenti dengan error: ${(err.message || "").slice(0, 400)}`;
           }
 
-          let auditSummary = "Belum ada repo baru dengan topic makefun.";
+          // Lapis ke-2: Jika repo baru ter-push tapi laporan belum memuat submissionId/bukti submit API make.fun, paksa selesaikan tahap submit sekarang selagi file .jsonl sesi masih ada di runner
+          let currentRepos = [];
           try {
             if (process.env.GH_TOKEN) {
               const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "10", "--json", "name,url,pushedAt"], { encoding: "utf8" });
-              const list = JSON.parse(out || "[]");
-              if (list.length > 0) {
-                auditSummary = list.map(r => `- ${r.name}: ${r.pushedAt ? `✅ Ter-push (${r.pushedAt})` : "❌ KOSONG (belum ada commit)"}`).join("\n");
+              currentRepos = JSON.parse(out || "[]");
+            }
+          } catch {}
+
+          const hasNewPush = currentRepos.some(r => r.pushedAt && !repos.includes(r.name));
+          const hasSubmitProof = /submission|submitted|preparing|scoring|scored/i.test(cleanMsg) && /[0-9a-f]{8}-[0-9a-f]{4}/i.test(cleanMsg);
+
+          if (hasNewPush && !hasSubmitProof) {
+            try {
+              const latestRepo = currentRepos.find(r => r.pushedAt && !repos.includes(r.name));
+              const followupPrompt = [
+                `Repo ${latestRepo.url} sudah berhasil di-push ke GitHub, tetapi kamu BELUM mengirimkan submission ke API make.fun!`,
+                "Baca bagian submit di skills/makefun/SKILL.md sekarang, ambil file .jsonl asli terbaru dari ~/.openclaw/agents/main/sessions/, kirim POST request submission untuk repo tersebut ke API make.fun menggunakan header x-api-key: $MAKEFUN_API_KEY, poll statusnya, dan laporkan respons JSON asli (submissionId & status)."
+              ].join("\n");
+              const submitMsg = runOpenclaw(followupPrompt);
+              if (submitMsg) cleanMsg = `${cleanMsg}\n\n📤 Hasil Submit API make.fun:\n${submitMsg}`;
+            } catch (err) {
+              cleanMsg = `${cleanMsg}\n\n⚠️ Gagal auto-submit lanjutan: ${(err.message || "").slice(0, 300)}`;
+            }
+          }
+
+          // Cek status submission langsung dari endpoint akun make.fun jika tersedia
+          let makefunAccountCheck = "";
+          try {
+            if (process.env.MAKEFUN_API_KEY) {
+              const res = await fetch("https://make.fun/api/submissions", {
+                headers: { Accept: "application/json", "x-api-key": process.env.MAKEFUN_API_KEY }
+              });
+              if (res.ok) {
+                const subData = await res.json();
+                const items = Array.isArray(subData) ? subData : (subData.submissions || subData.items || subData.data || []);
+                if (items.length > 0) {
+                  makefunAccountCheck = items.slice(0, 3).map(s => `- [${s.competitionSlug || s.slug || s.id}] status: ${s.status}`).join("\n");
+                }
               }
             }
           } catch {}
+
+          let auditSummary = "Belum ada repo baru dengan topic makefun.";
+          if (currentRepos.length > 0) {
+            auditSummary = currentRepos.map(r => `- ${r.name}: ${r.pushedAt ? `✅ Ter-push (${r.pushedAt})` : "❌ KOSONG"}`).join("\n");
+          }
 
           const finalReport = [
             cleanMsg || "⚠️ Tidak ada output teks dari agent.",
             "",
             "🔍 Audit Repo GitHub (Asli):",
             auditSummary,
+            makefunAccountCheck ? `\n📋 Audit Submission make.fun (Asli):\n${makefunAccountCheck}` : "",
             "",
             `⛽ ${gas}`
-          ].join("\n").slice(0, 3800);
+          ].filter(Boolean).join("\n").slice(0, 3800);
 
           const botToken = process.env.TELEGRAM_BOT_TOKEN;
           const chatId = process.env.TELEGRAM_CHAT_ID;
