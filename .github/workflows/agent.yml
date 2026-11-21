@@ -21,23 +21,25 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Mulai login dan tangkap link QR
-          LOGIN_OUT=$(baw auth signin 2>&1 || true)
-          QR_URL=$(echo "$LOGIN_OUT" | grep -oE 'https://app\.binance\.com/uni-qr/[a-zA-Z0-9_-]+' | head -n 1)
+          baw auth signin > /tmp/signin.log 2>&1 &
+          SIGNIN_PID=$!
+
+          for i in $(seq 1 15); do
+            QR_URL=$(grep -oE 'https://app\.binance\.com/uni-qr/[a-zA-Z0-9_-]+' /tmp/signin.log | head -n 1 || true)
+            [ -n "$QR_URL" ] && break
+            sleep 1
+          done
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=🔑 SEGERA SCAN LINK INI (berlaku 60 detik): ${QR_URL}"
 
-          # Tunggu user scan QR di HP (maksimal 90 detik)
-          baw auth verify || sleep 60
+          wait $SIGNIN_PID || baw auth verify || true
 
-          # Cek status & pack folder ~/.baw versi Linux
           baw wallet status --json
           tar -czf /tmp/baw_linux.tar.gz -C "$HOME" .baw
           B64_STR=$(base64 -w 0 /tmp/baw_linux.tar.gz)
 
-          # Kirim string BAW_SESSION_B64 ke Telegram pribadi
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=✅ COPY STRING BASE64 DI BAWAH INI KE SECRET BAW_SESSION_B64:"
