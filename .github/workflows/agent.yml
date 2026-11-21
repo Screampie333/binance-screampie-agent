@@ -37,14 +37,14 @@ jobs:
           CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176')
           REAL_URL=$(echo "$CLEAN_LOG" | grep -oE 'https://[^[:space:]]+' | head -n 1)
           PAIR_CODE=$(echo "$CLEAN_LOG" | grep -oE 'Pairing code:[[:space:]]*[a-zA-Z0-9]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+          CAPTION_TXT=$(printf "🔑 SCAN QR INI DARI APLIKASI BINANCE (Pairing Code: %s)\nURL: %s" "$PAIR_CODE" "$REAL_URL")
 
           qrencode -s 10 -o /tmp/qr.png "$REAL_URL"
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
             -F chat_id="${TELEGRAM_CHAT_ID}" \
             -F photo=@/tmp/qr.png \
-            -F caption="🔑 SCAN QR INI DARI APLIKASI BINANCE (Pairing Code: ${PAIR_CODE})
-URL: ${REAL_URL}"
+            -F caption="${CAPTION_TXT}"
 
           wait $SIGNIN_PID || baw auth verify || true
 
