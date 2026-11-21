@@ -46,12 +46,8 @@ jobs:
           openclaw models fallbacks add google/gemini-3.5-flash-lite || true
 
           cp AGENTS.md "$HOME/.openclaw/workspace/AGENTS.md"
-          cat <<EOF > "$HOME/.openclaw/.env"
-          GEMINI_API_KEY=${GEMINI_API_KEY}
-          GROQ_API_KEY=${GROQ_API_KEY}
-          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-          MAKEFUN_API_KEY=${MAKEFUN_API_KEY}
-          EOF
+          printf "GEMINI_API_KEY=%s\nGROQ_API_KEY=%s\nTELEGRAM_BOT_TOKEN=%s\nMAKEFUN_API_KEY=%s\n" \
+            "$GEMINI_API_KEY" "$GROQ_API_KEY" "$TELEGRAM_BOT_TOKEN" "$MAKEFUN_API_KEY" > "$HOME/.openclaw/.env"
           chmod 600 "$HOME/.openclaw/.env"
 
           cd "$HOME/.openclaw/workspace"
@@ -102,78 +98,4 @@ jobs:
               try {
                 const headers = { "Accept": "application/json" };
                 if (process.env.MAKEFUN_API_KEY) headers["x-api-key"] = process.env.MAKEFUN_API_KEY;
-                const res = await fetch("https://make.fun/api/competitions?limit=200", { headers });
-                const data = await res.json();
-                const list = Array.isArray(data) ? data : (data.competitions || data.items || data.data || []);
-                const summary = list.slice(0, 15).map(item => {
-                  const slug = item.slug || item.id || "";
-                  const title = item.title || item.name || "Untitled";
-                  const fee = item.entryFee ?? item.fee ?? item.price ?? 0;
-                  const prize = item.prize ?? item.reward ?? "unknown";
-                  const status = item.status || "open";
-                  return `- [${slug}] ${title} | prize: ${prize} | fee: ${fee} | status: ${status}`;
-                }).join("\n");
-                console.log(summary || "Tidak ada data kompetisi make.fun.");
-              } catch (e) {
-                console.log("Gagal mengambil data make.fun API.");
-              }
-            })();
-          ')
-          echo "MAKEFUN_FEED<<EOF" >> $GITHUB_ENV
-          echo "$MAKEFUN_FEED" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-          if [ -n "$DISCORD_BOT_TOKEN" ] && [ -n "$DISCORD_CHANNEL_ID" ]; then
-            ALL_MSGS=""
-            IFS=',' read -ra CHANNELS <<< "$DISCORD_CHANNEL_ID"
-            for CH_ID in "${CHANNELS[@]}"; do
-              CH_ID=$(echo "$CH_ID" | xargs)
-              [ -z "$CH_ID" ] && continue
-              MSGS=$(curl -s -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
-                "https://discord.com/api/v10/channels/${CH_ID}/messages?limit=5" | \
-                node -e '
-                  const fs = require("fs");
-                  const chId = process.argv[1];
-                  try {
-                    const list = JSON.parse(fs.readFileSync(0, "utf8"));
-                    if (Array.isArray(list)) {
-                      console.log(list.map(m => `[Channel:${chId} | ${m.author?.username}]: ${m.content}`).join("\n"));
-                    }
-                  } catch {}
-                ' "$CH_ID")
-              ALL_MSGS="${ALL_MSGS}\n${MSGS}"
-            done
-            echo "DISCORD_FEED<<EOF" >> $GITHUB_ENV
-            echo -e "$ALL_MSGS" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-          fi
-
-      - name: Execute Agent Cycle & Notify Telegram
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
-          USER_CMD: ${{ github.event.client_payload.command }}
-        run: |
-          cd "$HOME/.openclaw/workspace"
-          if [ -n "$USER_CMD" ]; then
-            PROMPT="Perintah langsung dari user (${USER_CMD}). Gas saat ini: ${GAS_REPORT}. Daftar bounty make.fun terbaru:\n${MAKEFUN_FEED}\nGunakan skill makefun di skills/makefun/SKILL.md dan jawab dengan rapi, singkat, dan langsung ke inti (maksimal 1500 karakter)."
-          else
-            PROMPT="Gas saat ini: ${GAS_REPORT}.\n\nBounty make.fun terbaru:\n${MAKEFUN_FEED}\n\nPesan Discord terbaru:\n${DISCORD_FEED}\n\nIkuti aturan di AGENTS.md dan skills/makefun/SKILL.md. Saring bounty GRATIS ($0) di make.fun (cek prerequisites-nya), laporkan bounty berbayar atau yang butuh aksi manual (X/YouTube/Roblox) ke owner, dan saring peluang Free Mint on-chain yang aman (tolak link t.me / bot pihak ketiga / tawaran akses wallet). Tulis laporan rapi maksimal 1500 karakter."
-          fi
-
-          RAW_JSON=$(openclaw agent --local --json --message "$PROMPT" 2>/dev/null || true)
-          CLEAN_MSG=$(node -e '
-            const raw = process.argv[1] || "";
-            const start = raw.indexOf("{");
-            if (start === -1) process.exit(0);
-            try {
-              const data = JSON.parse(raw.slice(start));
-              const text = data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
-              console.log(text);
-            } catch {}
-          ' "$RAW_JSON")
-
-          MSG="${CLEAN_MSG:-⛽ Gas Fee: ${GAS_REPORT
+                const res = await fetch("
