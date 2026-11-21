@@ -74,14 +74,12 @@ jobs:
           curl -fsSL "https://make.fun/skill.md" -o "$HOME/.openclaw/workspace/skills/makefun/SKILL.md"
           curl -fsSL "https://make.fun/heartbeat.md" -o "$HOME/.openclaw/workspace/skills/makefun/heartbeat.md" || true
 
-      - name: Fetch Free Bounties, Existing Repos & Gas RPC
+      - name: Select Target Free Bounty & Fetch Gas RPC
         env:
-          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          cat <<'EOF' > /tmp/fetch_feeds.mjs
+          cat <<'EOF' > /tmp/select_bounty.mjs
           import fs from "node:fs";
           import { execFileSync } from "node:child_process";
 
@@ -114,60 +112,54 @@ jobs:
           ]);
           setEnv("GAS_REPORT", gasList.join(" | "));
 
+          let existingNames = [];
           try {
-            const headers = { Accept: "application/json" };
-            if (process.env.MAKEFUN_API_KEY) headers["x-api-key"] = process.env.MAKEFUN_API_KEY;
+            if (process.env.GH_TOKEN) {
+              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--limit", "100", "--json", "name"], { encoding: "utf8" });
+              existingNames = JSON.parse(out || "[]").map(r => r.name.toLowerCase());
+            }
+          } catch {}
+
+          const headers = { Accept: "application/json" };
+          if (process.env.MAKEFUN_API_KEY) headers["x-api-key"] = process.env.MAKEFUN_API_KEY;
+
+          let targetSlug = "";
+          let targetTitle = "";
+          try {
             const res = await fetch("https://make.fun/api/competitions?limit=200", { headers });
             const data = await res.json();
             const list = Array.isArray(data) ? data : (data.competitions || data.items || data.data || []);
-            const freeOpen = list.filter(item => {
+            const candidates = list.filter(item => {
+              const slug = String(item.slug || item.id || "").toLowerCase();
               const fee = Number(item.entryFee ?? item.fee ?? item.price ?? 0);
               const status = String(item.status || "open").toLowerCase();
-              return fee === 0 && (status === "open" || status === "active");
+              const alreadyBuilt = existingNames.some(n => n === `makefun-${slug}` || n.includes(slug));
+              return slug && fee === 0 && (status === "open" || status === "active") && !alreadyBuilt;
             });
-            const summary = freeOpen.slice(0, 25).map(item => {
-              const slug = item.slug || item.id || "";
-              const title = item.title || item.name || "Untitled";
-              const prize = item.prize ?? item.reward ?? "unknown";
-              return `- [${slug}] ${title} | prize: ${prize} | fee: $0 | status: open`;
-            }).join("\n");
-            setEnv("MAKEFUN_FEED", summary || "Tidak ada free bounty ($0) yang open saat ini.");
-          } catch {
-            setEnv("MAKEFUN_FEED", "Gagal mengambil data make.fun API.");
-          }
 
-          let existingRepos = "Belum ada repo makefun.";
-          try {
-            if (process.env.GH_TOKEN) {
-              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "100", "--json", "name,url,pushedAt"], { encoding: "utf8" });
-              existingRepos = out.trim() || existingRepos;
-            }
-          } catch {}
-          setEnv("EXISTING_REPOS", existingRepos);
-
-          const dcToken = process.env.DISCORD_BOT_TOKEN || "";
-          const dcChannels = (process.env.DISCORD_CHANNEL_ID || "").split(",").map(s => s.trim()).filter(Boolean);
-          if (dcToken && dcChannels.length > 0) {
-            const allMsgs = [];
-            for (const chId of dcChannels) {
+            for (const c of candidates) {
+              const slug = c.slug || c.id;
               try {
-                const res = await fetch(`https://discord.com/api/v10/channels/${chId}/messages?limit=5`, {
-                  headers: { Authorization: `Bot ${dcToken}` }
-                });
-                const list = await res.json();
-                if (Array.isArray(list)) {
-                  allMsgs.push(...list.map(m => `[Channel:${chId} | ${m.author?.username}]: ${m.content}`));
+                const reqRes = await fetch(`https://make.fun/api/competitions/${slug}/requirements`, { headers });
+                if (reqRes.ok) {
+                  const reqJson = await reqRes.json();
+                  const prereqs = Array.isArray(reqJson) ? reqJson : (reqJson.prerequisites || []);
+                  const hasHumanStep = prereqs.some(p => p.required !== false);
+                  if (hasHumanStep) continue;
                 }
               } catch {}
+              targetSlug = slug;
+              targetTitle = c.title || c.name || slug;
+              break;
             }
-            setEnv("DISCORD_FEED", allMsgs.join("\n"));
-          } else {
-            setEnv("DISCORD_FEED", "");
-          }
-          EOF
-          node /tmp/fetch_feeds.mjs
+          } catch {}
 
-      - name: Execute Full Autopilot Builder & Submit to make.fun
+          setEnv("TARGET_SLUG", targetSlug);
+          setEnv("TARGET_TITLE", targetTitle);
+          EOF
+          node /tmp/select_bounty.mjs
+
+      - name: Build Code in OpenClaw Session, Push Repo & Submit to make.fun
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -176,9 +168,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          USER_CMD: ${{ github.event.client_payload.command }}
         run: |
-          cat <<'EOF' > /tmp/run_agent.mjs
+          cat <<'EOF' > /tmp/build_and_submit.mjs
           import { execFileSync } from "node:child_process";
           import fs from "node:fs";
           import os from "node:os";
@@ -191,129 +182,186 @@ jobs:
             PATH: `${path.join(home, ".npm-global", "bin")}:${process.env.PATH || ""}`
           };
 
-          const cmd = process.env.USER_CMD || "";
+          const slug = (process.env.TARGET_SLUG || "").trim();
+          const title = (process.env.TARGET_TITLE || slug).trim();
           const gas = process.env.GAS_REPORT || "";
-          const mf = process.env.MAKEFUN_FEED || "";
-          const repos = process.env.EXISTING_REPOS || "";
-          const dc = process.env.DISCORD_FEED || "";
+          const botToken = process.env.TELEGRAM_BOT_TOKEN;
+          const chatId = process.env.TELEGRAM_CHAT_ID;
+          const apiKey = process.env.MAKEFUN_API_KEY || "";
 
-          function runOpenclaw(message) {
-            const raw = execFileSync("openclaw", ["agent", "--local", "--json", "--message", message], {
+          async function notify(text) {
+            await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3900) })
+            });
+          }
+
+          if (!slug) {
+            await notify(`ℹ️ Tidak ada bounty gratis ($0) baru tanpa human-only steps saat ini.\n\n⛽ ${gas}`);
+            process.exit(0);
+          }
+
+          const workDir = `/tmp/work-${slug}`;
+          fs.mkdirSync(workDir, { recursive: true });
+
+          // 1. Jalankan OpenClaw KHUSUS untuk menulis kode & verifikasi kit (agar session .jsonl tertutup rapi saat exit)
+          const buildPrompt = [
+            `Tugasmu membangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
+            "JANGAN jalankan gh repo create dan JANGAN kirim submit API (skrip pipeline akan melakukannya otomatis setelah kamu selesai agar file .jsonl sesimu tertutup sempurna).",
+            "Lakukan secara bertahap minimal 6 putaran tool call agar lolos validasi harness:",
+            `1) Baca skills/makefun/SKILL.md dan fetch detail/kit bounty "${slug}" dari https://make.fun/api/competitions/${slug}.`,
+            `2) Unduh/ekstrak kit bounty ke "${workDir}", baca RULES.txt, dan quote baris anchor di output tool pertama sebelum menulis file apa pun.`,
+            `3) Tulis file kode inti di "${workDir}" menggunakan tool tulis file.`,
+            `4) Tulis file test / modul pendukung di "${workDir}" menggunakan tool tulis file.`,
+            `5) Tulis README.md di "${workDir}" sesuai aturan RULES.txt.`,
+            `6) Jalankan script verifikasi/check dari kit di "${workDir}" sampai lulus 100%, lalu selesai.`
+          ].join("\n");
+
+          let agentSummary = "";
+          try {
+            const raw = execFileSync("openclaw", ["agent", "--local", "--json", "--message", buildPrompt], {
               cwd: workspace,
               env,
               encoding: "utf8",
-              maxBuffer: 20 * 1024 * 1024
+              maxBuffer: 25 * 1024 * 1024
             });
             const start = raw.indexOf("{");
-            if (start === -1) return "";
-            const data = JSON.parse(raw.slice(start));
-            return data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
-          }
-
-          const baseContext = [
-            `Gas saat ini: ${gas}`,
-            "Repo makefun yang sudah ada di akun Screampie333 (lewati semua slug yang sudah ada di sini):",
-            repos,
-            "",
-            "Kandidat bounty GRATIS ($0) berstatus open di make.fun:",
-            mf,
-            "",
-            "Feed Discord terbaru:",
-            dc
-          ].join("\n");
-
-          const prompt = cmd
-            ? [
-                `Perintah langsung dari owner: "${cmd}".`,
-                baseContext,
-                "Jalankan sesuai AGENTS.md dan skills/makefun/SKILL.md sampai benar-benar ter-submit ke API make.fun dan menampilkan submissionId asli. Tulis laporan ringkas maksimal 1600 karakter."
-              ].join("\n")
-            : [
-                "MODE FULL AUTOPILOT AKTIF. Tugasmu BELUM selesai sebelum memanggil endpoint POST submit di API make.fun dan mendapatkan submissionId asli.",
-                baseContext,
-                "Instruksi wajib (lakukan secara bertahap minimal 8 putaran tool call):",
-                "1) Baca seluruh isi skills/makefun/SKILL.md sampai habis (terutama endpoint & payload POST submission).",
-                "2) Pilih 1 bounty GRATIS ($0) berstatus open yang belum ada di daftar repo Screampie333 dan cek GET https://make.fun/api/competitions/<slug>/requirements.",
-                "3) Unduh kit bounty ke /tmp/work-<slug>, baca RULES.txt, dan quote baris anchor di output tool pertama sebelum menulis file apa pun.",
-                "4) Tulis kode proyek secara bertahap dalam beberapa turn terpisah (kode utama, test/modul, README.md) menggunakan tool tulis file di sesi ini (>=30% authored lines).",
-                "5) Jalankan script check dari kit hingga lulus 100%.",
-                "6) Inisialisasi git, commit semua file, buat repo publik baru (gh repo create Screampie333/makefun-<slug> --public --source=. --remote=origin --push), dan tambah topic makefun (gh repo edit Screampie333/makefun-<slug> --add-topic makefun).",
-                "7) WAJIB EKSEKUSI SUBMIT API: Ambil file .jsonl asli terbaru dari ~/.openclaw/agents/main/sessions/ (DILARANG mengedit/membuat manual), bundel sesuai instruksi di skills/makefun/SKILL.md, jalankan request POST submission ke https://make.fun/api/... dengan header x-api-key: $MAKEFUN_API_KEY, lalu poll status submission tersebut.",
-                "8) Laporkan URL repo GitHub, submissionId asli, dan status submission dari server make.fun (maksimal 1500 karakter)."
-              ].join("\n");
-
-          let cleanMsg = "";
-          try {
-            cleanMsg = runOpenclaw(prompt);
+            if (start !== -1) {
+              const data = JSON.parse(raw.slice(start));
+              agentSummary = data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
+            }
           } catch (err) {
-            cleanMsg = `⚠️ Siklus autopilot berhenti dengan error: ${(err.message || "").slice(0, 400)}`;
+            await notify(`⚠️ Gagal saat tahap build OpenClaw untuk ${slug}:\n${(err.message || "").slice(0, 600)}`);
+            process.exit(1);
           }
 
-          // Lapis ke-2: Jika repo baru ter-push tapi laporan belum memuat submissionId/bukti submit API make.fun, paksa selesaikan tahap submit sekarang selagi file .jsonl sesi masih ada di runner
-          let currentRepos = [];
+          // Pastikan ada file kode di workDir
+          const files = fs.readdirSync(workDir).filter(f => !f.startsWith("."));
+          if (files.length === 0) {
+            await notify(`⚠️ Direktori ${workDir} kosong setelah OpenClaw selesai.\n\nLog agent:\n${agentSummary.slice(0, 800)}`);
+            process.exit(1);
+          }
+
+          // 2. Push ke repo publik GitHub dengan topic makefun
+          const repoFull = `Screampie333/makefun-${slug}`;
+          const repoUrl = `https://github.com/${repoFull}`;
+          let commitSha = "";
           try {
-            if (process.env.GH_TOKEN) {
-              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "10", "--json", "name,url,pushedAt"], { encoding: "utf8" });
-              currentRepos = JSON.parse(out || "[]");
-            }
-          } catch {}
+            fs.writeFileSync(path.join(workDir, ".gitignore"), "__pycache__/\n*.pyc\nnode_modules/\n.env\n");
+            execFileSync("git", ["init"], { cwd: workDir, env });
+            execFileSync("git", ["add", "-A"], { cwd: workDir, env });
+            execFileSync("git", ["commit", "-m", `Initial entry for ${slug}`], { cwd: workDir, env });
+            commitSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: workDir, env, encoding: "utf8" }).trim();
 
-          const hasNewPush = currentRepos.some(r => r.pushedAt && !repos.includes(r.name));
-          const hasSubmitProof = /submission|submitted|preparing|scoring|scored/i.test(cleanMsg) && /[0-9a-f]{8}-[0-9a-f]{4}/i.test(cleanMsg);
-
-          if (hasNewPush && !hasSubmitProof) {
+            let repoExists = false;
             try {
-              const latestRepo = currentRepos.find(r => r.pushedAt && !repos.includes(r.name));
-              const followupPrompt = [
-                `Repo ${latestRepo.url} sudah berhasil di-push ke GitHub, tetapi kamu BELUM mengirimkan submission ke API make.fun!`,
-                "Baca bagian submit di skills/makefun/SKILL.md sekarang, ambil file .jsonl asli terbaru dari ~/.openclaw/agents/main/sessions/, kirim POST request submission untuk repo tersebut ke API make.fun menggunakan header x-api-key: $MAKEFUN_API_KEY, poll statusnya, dan laporkan respons JSON asli (submissionId & status)."
-              ].join("\n");
-              const submitMsg = runOpenclaw(followupPrompt);
-              if (submitMsg) cleanMsg = `${cleanMsg}\n\n📤 Hasil Submit API make.fun:\n${submitMsg}`;
-            } catch (err) {
-              cleanMsg = `${cleanMsg}\n\n⚠️ Gagal auto-submit lanjutan: ${(err.message || "").slice(0, 300)}`;
+              execFileSync("gh", ["repo", "view", repoFull], { cwd: workDir, env, stdio: "ignore" });
+              repoExists = true;
+            } catch {}
+
+            if (repoExists) {
+              try { execFileSync("git", ["remote", "remove", "origin"], { cwd: workDir, env, stdio: "ignore" }); } catch {}
+              execFileSync("git", ["remote", "add", "origin", `${repoUrl}.git`], { cwd: workDir, env });
+              execFileSync("git", ["push", "-u", "origin", "main", "--force"], { cwd: workDir, env });
+            } else {
+              execFileSync("gh", ["repo", "create", repoFull, "--public", "--source=.", "--remote=origin", "--push"], { cwd: workDir, env });
+            }
+            execFileSync("gh", ["repo", "edit", repoFull, "--add-topic", "makefun"], { cwd: workDir, env });
+          } catch (err) {
+            await notify(`⚠️ Kode selesai dibuat, tapi gagal push ke GitHub (${repoFull}):\n${(err.message || "").slice(0, 600)}`);
+            process.exit(1);
+          }
+
+          // 3. Ambil file transkrip .jsonl asli OpenClaw yang sudah tertutup sempurna
+          const sessionsDir = path.join(home, ".openclaw", "agents", "main", "sessions");
+          let transcriptRaw = "";
+          let transcriptLines = [];
+          if (fs.existsSync(sessionsDir)) {
+            const jsonlFiles = fs.readdirSync(sessionsDir)
+              .filter(f => f.endsWith(".jsonl"))
+              .map(f => ({ name: f, full: path.join(sessionsDir, f), mtime: fs.statSync(path.join(sessionsDir, f)).mtimeMs }))
+              .sort((a, b) => b.mtime - a.mtime);
+            if (jsonlFiles.length > 0) {
+              transcriptRaw = fs.readFileSync(jsonlFiles[0].full, "utf8");
+              transcriptLines = transcriptRaw.split("\n").filter(Boolean).map(line => {
+                try { return JSON.parse(line); } catch { return { raw: line }; }
+              });
             }
           }
 
-          // Cek status submission langsung dari endpoint akun make.fun jika tersedia
-          let makefunAccountCheck = "";
+          // 4. Baca spesifikasi submit dari SKILL.md & kirim langsung via fetch()
+          const skillMd = fs.readFileSync(path.join(workspace, "skills", "makefun", "SKILL.md"), "utf8");
+          let submitSpec = {
+            url: `https://make.fun/api/competitions/${slug}/submit`,
+            payload: {
+              repoUrl,
+              commitSha,
+              transcript: transcriptLines
+            }
+          };
+
           try {
-            if (process.env.MAKEFUN_API_KEY) {
-              const res = await fetch("https://make.fun/api/submissions", {
-                headers: { Accept: "application/json", "x-api-key": process.env.MAKEFUN_API_KEY }
-              });
-              if (res.ok) {
-                const subData = await res.json();
-                const items = Array.isArray(subData) ? subData : (subData.submissions || subData.items || subData.data || []);
-                if (items.length > 0) {
-                  makefunAccountCheck = items.slice(0, 3).map(s => `- [${s.competitionSlug || s.slug || s.id}] status: ${s.status}`).join("\n");
+            const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [{
+                    text: `Extract the exact HTTP submission endpoint URL and JSON request body keys from this make.fun SKILL.md for competition slug "${slug}". Return ONLY JSON with keys: "url" (full https://make.fun/api/... URL with "${slug}" substituted), "repoKey" (exact field name for repository URL), "commitKey" (exact field name for commit SHA, or null), "transcriptKey" (exact field name for transcript), "transcriptFormat" ("array" or "string" or "files_array").\n\nSKILL.MD:\n${skillMd}`
+                  }]
+                }],
+                generationConfig: { responseMimeType: "application/json" }
+              })
+            });
+            if (geminiRes.ok) {
+              const gData = await geminiRes.json();
+              const parsed = JSON.parse(gData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}");
+              if (parsed.url && parsed.repoKey && parsed.transcriptKey) {
+                const dynamicPayload = {
+                  [parsed.repoKey]: repoUrl
+                };
+                if (parsed.commitKey) dynamicPayload[parsed.commitKey] = commitSha;
+                if (parsed.transcriptFormat === "string") {
+                  dynamicPayload[parsed.transcriptKey] = transcriptRaw;
+                } else if (parsed.transcriptFormat === "files_array") {
+                  dynamicPayload[parsed.transcriptKey] = [{ name: "session.jsonl", content: transcriptRaw }];
+                } else {
+                  dynamicPayload[parsed.transcriptKey] = transcriptLines;
                 }
+                submitSpec = { url: parsed.url, payload: dynamicPayload };
               }
             }
           } catch {}
 
-          let auditSummary = "Belum ada repo baru dengan topic makefun.";
-          if (currentRepos.length > 0) {
-            auditSummary = currentRepos.map(r => `- ${r.name}: ${r.pushedAt ? `✅ Ter-push (${r.pushedAt})` : "❌ KOSONG"}`).join("\n");
+          let submitStatusLine = "";
+          try {
+            const subRes = await fetch(submitSpec.url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "x-api-key": apiKey
+              },
+              body: JSON.stringify(submitSpec.payload)
+            });
+            const subText = await subRes.text();
+            submitStatusLine = `HTTP ${subRes.status} (${submitSpec.url}):\n${subText.slice(0, 900)}`;
+          } catch (err) {
+            submitStatusLine = `Gagal koneksi ke ${submitSpec.url}: ${err.message}`;
           }
 
           const finalReport = [
-            cleanMsg || "⚠️ Tidak ada output teks dari agent.",
+            `🚀 Autopilot Bounty: ${title} (${slug})`,
+            `📦 Repo GitHub: ${repoUrl}`,
+            `🔖 Commit: ${commitSha.slice(0, 7)} | Transcript turns: ${transcriptLines.length}`,
             "",
-            "🔍 Audit Repo GitHub (Asli):",
-            auditSummary,
-            makefunAccountCheck ? `\n📋 Audit Submission make.fun (Asli):\n${makefunAccountCheck}` : "",
+            "📤 Hasil Submit API make.fun (Asli):",
+            submitStatusLine,
             "",
             `⛽ ${gas}`
-          ].filter(Boolean).join("\n").slice(0, 3800);
+          ].join("\n");
 
-          const botToken = process.env.TELEGRAM_BOT_TOKEN;
-          const chatId = process.env.TELEGRAM_CHAT_ID;
-
-          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: finalReport })
-          });
+          await notify(finalReport);
           EOF
-          node /tmp/run_agent.mjs
+          node /tmp/build_and_submit.mjs
