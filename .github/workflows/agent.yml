@@ -74,7 +74,7 @@ jobs:
           curl -fsSL "https://make.fun/skill.md" -o "$HOME/.openclaw/workspace/skills/makefun/SKILL.md"
           curl -fsSL "https://make.fun/heartbeat.md" -o "$HOME/.openclaw/workspace/skills/makefun/heartbeat.md" || true
 
-      - name: Select Target Free Bounty & Fetch Gas RPC
+      - name: Check Failed Submissions First or Select New Free Bounty
         env:
           MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -112,54 +112,115 @@ jobs:
           ]);
           setEnv("GAS_REPORT", gasList.join(" | "));
 
-          let existingNames = [];
+          let existingRepos = [];
           try {
             if (process.env.GH_TOKEN) {
-              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--limit", "100", "--json", "name"], { encoding: "utf8", timeout: 30000 });
-              existingNames = JSON.parse(out || "[]").map(r => r.name.toLowerCase());
+              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--limit", "100", "--json", "name,url"], { encoding: "utf8", timeout: 30000 });
+              existingRepos = JSON.parse(out || "[]");
             }
           } catch {}
+          const existingNames = existingRepos.map(r => r.name.toLowerCase());
 
           const headers = { Accept: "application/json" };
           if (process.env.MAKEFUN_API_KEY) headers["x-api-key"] = process.env.MAKEFUN_API_KEY;
 
+          let mode = "new";
           let targetSlug = "";
           let targetTitle = "";
-          try {
-            const res = await fetch("https://make.fun/api/competitions?limit=200", { headers });
-            const data = await res.json();
-            const list = Array.isArray(data) ? data : (data.competitions || data.items || data.data || []);
-            const candidates = list.filter(item => {
-              const slug = String(item.slug || item.id || "").toLowerCase();
-              const fee = Number(item.entryFee ?? item.fee ?? item.price ?? 0);
-              const status = String(item.status || "open").toLowerCase();
-              const alreadyBuilt = existingNames.some(n => n === `makefun-${slug}` || n.includes(slug));
-              return slug && fee === 0 && (status === "open" || status === "active") && !alreadyBuilt;
-            });
+          let failedDetail = "";
 
-            for (const c of candidates) {
-              const slug = c.slug || c.id;
-              try {
-                const reqRes = await fetch(`https://make.fun/api/competitions/${slug}/requirements`, { headers });
-                if (reqRes.ok) {
-                  const reqJson = await reqRes.json();
-                  const prereqs = Array.isArray(reqJson) ? reqJson : (reqJson.prerequisites || []);
-                  const hasHumanStep = prereqs.some(p => p.required !== false);
-                  if (hasHumanStep) continue;
-                }
-              } catch {}
-              targetSlug = slug;
-              targetTitle = c.title || c.name || slug;
-              break;
-            }
-          } catch {}
+          // 1. Prioritas Utama: Cek apakah ada entry lama yang berstatus gagal / check failed untuk di-Fix & Resubmit
+          const makefunRepos = existingRepos.filter(r => r.name.toLowerCase().startsWith("makefun-"));
+          for (const repo of makefunRepos) {
+            const slug = repo.name.slice("makefun-".length);
+            try {
+              // Pastikan kompetisi masih open
+              const compRes = await fetch(`https://make.fun/api/competitions/${slug}`, { headers });
+              if (!compRes.ok) continue;
+              const compJson = await compRes.json();
+              const compObj = compJson.competition || compJson.data || compJson;
+              const status = String(compObj.status || "open").toLowerCase();
+              if (status !== "open" && status !== "active") continue;
 
+              // Tarik daftar submission milik akun kita di kompetisi ini
+              const subsRes = await fetch(`https://make.fun/api/competitions/${slug}/submissions`, { headers });
+              if (!subsRes.ok) continue;
+              const subsJson = await subsRes.json();
+              const subsList = Array.isArray(subsJson) ? subsJson : (subsJson.submissions || subsJson.items || subsJson.data || []);
+              const mine = subsList.filter(s => String(s.repo || s.repo_url || "").toLowerCase().includes(repo.name.toLowerCase()));
+              if (mine.length === 0) continue;
+
+              // Batasi maksimal 4 percobaan resubmit agar tidak looping jika ada kendala non-teknis
+              if (mine.length >= 4) continue;
+
+              const latest = mine[0];
+              const subId = latest.id || latest.submission_id;
+              let detailObj = latest;
+              if (subId) {
+                const detRes = await fetch(`https://make.fun/api/submissions/${subId}`, { headers });
+                if (detRes.ok) detailObj = await detRes.json();
+              }
+
+              const subStatus = String(detailObj.status || "").toLowerCase();
+              const checks = Array.isArray(detailObj.checks) ? detailObj.checks : [];
+              const failedChecks = checks.filter(c => /fail|reject|error/i.test(String(c.status || "")));
+
+              if (/fail|reject|error/i.test(subStatus) || failedChecks.length > 0) {
+                mode = "fix";
+                targetSlug = slug;
+                targetTitle = compObj.title || compObj.name || slug;
+                failedDetail = JSON.stringify({
+                  submission_id: subId,
+                  status: detailObj.status,
+                  detail: detailObj.detail || detailObj.reason || "",
+                  failed_checks: failedChecks.length > 0 ? failedChecks : checks
+                }, null, 2);
+                break;
+              }
+            } catch {}
+          }
+
+          // 2. Jika tidak ada entry gagal yang perlu diperbaiki, cari bounty GRATIS ($0) baru
+          if (!targetSlug) {
+            try {
+              const res = await fetch("https://make.fun/api/competitions?limit=200", { headers });
+              const data = await res.json();
+              const list = Array.isArray(data) ? data : (data.competitions || data.items || data.data || []);
+              const candidates = list.filter(item => {
+                const slug = String(item.slug || item.id || "").toLowerCase();
+                const fee = Number(item.entryFee ?? item.fee ?? item.price ?? 0);
+                const status = String(item.status || "open").toLowerCase();
+                const alreadyBuilt = existingNames.some(n => n === `makefun-${slug}` || n.includes(slug));
+                return slug && fee === 0 && (status === "open" || status === "active") && !alreadyBuilt;
+              });
+
+              for (const c of candidates) {
+                const slug = c.slug || c.id;
+                try {
+                  const reqRes = await fetch(`https://make.fun/api/competitions/${slug}/requirements`, { headers });
+                  if (reqRes.ok) {
+                    const reqJson = await reqRes.json();
+                    const prereqs = Array.isArray(reqJson) ? reqJson : (reqJson.prerequisites || []);
+                    const hasHumanStep = prereqs.some(p => p.required !== false);
+                    if (hasHumanStep) continue;
+                  }
+                } catch {}
+                mode = "new";
+                targetSlug = slug;
+                targetTitle = c.title || c.name || slug;
+                break;
+              }
+            } catch {}
+          }
+
+          setEnv("BUILD_MODE", mode);
           setEnv("TARGET_SLUG", targetSlug);
           setEnv("TARGET_TITLE", targetTitle);
+          setEnv("FAILED_DETAIL", failedDetail);
           EOF
           node /tmp/select_bounty.mjs
 
-      - name: Build Code, Inject make.fun Badges & About, Push & Submit
+      - name: Build or Auto-Fix Code, Inject Badges & About, Push & Submit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -182,8 +243,10 @@ jobs:
             PATH: `${path.join(home, ".npm-global", "bin")}:${process.env.PATH || ""}`
           };
 
+          const mode = (process.env.BUILD_MODE || "new").trim();
           const slug = (process.env.TARGET_SLUG || "").trim();
           const title = (process.env.TARGET_TITLE || slug).trim();
+          const failedDetail = (process.env.FAILED_DETAIL || "").trim();
           const gas = process.env.GAS_REPORT || "";
           const botToken = process.env.TELEGRAM_BOT_TOKEN;
           const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -198,11 +261,17 @@ jobs:
           }
 
           if (!slug) {
-            await notify(`ℹ️ Tidak ada bounty gratis ($0) baru tanpa human-only steps saat ini.\n\n⛽ ${gas}`);
+            await notify(`ℹ️ Tidak ada entry gagal yang perlu diperbaiki maupun bounty gratis ($0) baru saat ini.\n\n⛽ ${gas}`);
             process.exit(0);
           }
 
-          // 1. Ambil requirements & readme_template dari make.fun sebelum build
+          const owner = "Screampie333";
+          const repoName = `makefun-${slug}`;
+          const repoFull = `${owner}/${repoName}`;
+          const repoUrl = `https://github.com/${repoFull}`;
+          const bountyUrl = `https://make.fun/bounty/${slug}`;
+
+          // 1. Ambil requirements & readme_template dari make.fun
           let reqData = {};
           try {
             const reqRes = await fetch(`https://make.fun/api/competitions/${slug}/requirements`, {
@@ -211,39 +280,59 @@ jobs:
             if (reqRes.ok) reqData = await reqRes.json();
           } catch {}
 
-          // 2. Jalankan OpenClaw untuk menulis kode & menjalankan verifikasi singkat (maks 4 menit)
+          // 2. Siapkan direktori kerja (clone repo lama jika mode === "fix")
           const workDir = `/tmp/work-${slug}`;
-          fs.mkdirSync(workDir, { recursive: true });
+          fs.rmSync(workDir, { recursive: true, force: true });
+
+          if (mode === "fix") {
+            try {
+              execFileSync("git", ["clone", `${repoUrl}.git`, workDir], { env, timeout: 60000 });
+            } catch {
+              fs.mkdirSync(workDir, { recursive: true });
+            }
+          } else {
+            fs.mkdirSync(workDir, { recursive: true });
+          }
+
           const sessionId = `makefun-${slug}-${Date.now()}`;
+          const buildPrompt = mode === "fix"
+            ? [
+                `MODE AUTO-FIX: Submission sebelumnya untuk bounty "${slug}" (${title}) di "${workDir}" GAGAL pada pengecekan make.fun.`,
+                "Detail error resmi dari API make.fun:",
+                failedDetail,
+                "",
+                "Instruksi perbaikan wajib (selesaikan di bawah 90 detik, maksimal 6 tool call singkat, JANGAN jalankan git push atau submit API sendiri):",
+                `1) Periksa isi direktori "${workDir}" dan baca RULES.txt (jika belum ada, fetch kit dari https://make.fun/api/competitions/${slug} dan ekstrak ke "${workDir}").`,
+                `2) Analisis penyebab kegagalan pada detail error di atas (misalnya batas ukuran file, format output, bug kode, atau aturan RULES.txt).`,
+                `3) Perbaiki file kode di "${workDir}" menggunakan tool tulis/edit file agar lolos 100% syarat tersebut.`,
+                `4) Jalankan pengujian singkat (<5 detik) di "${workDir}" untuk memastikan tidak ada syntax/runtime error, lalu segera akhiri sesi.`
+              ].join("\n")
+            : [
+                `Bangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
+                "PENTING: Selesaikan dalam waktu di bawah 90 detik (maksimal 6 tool call singkat). Semua tes wajib selesai di bawah 5 detik. JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
+                `1) Fetch detail/kit bounty "${slug}" dari https://make.fun/api/competitions/${slug} dan ekstrak ke "${workDir}".`,
+                `2) Baca RULES.txt di "${workDir}" dan quote baris anchor di output tool pertama.`,
+                `3) Tulis file kode utama yang bersih & mematuhi batas ukuran di "${workDir}".`,
+                `4) Tulis file test singkat di "${workDir}" dan jalankan check/verifikasi cepat (<5 detik).`,
+                `5) Segera akhiri sesi dengan ringkasan 2 kalimat.`
+              ].join("\n");
 
-          const buildPrompt = [
-            `Bangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
-            "PENTING: Selesaikan dalam waktu di bawah 2 menit (maksimal 6 tool call singkat). Semua tes wajib selesai di bawah 5 detik. JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
-            `1) Fetch detail/kit bounty "${slug}" dari https://make.fun/api/competitions/${slug} dan ekstrak ke "${workDir}".`,
-            `2) Baca RULES.txt di "${workDir}" dan quote baris anchor di output tool pertama.`,
-            `3) Tulis file kode utama yang bersih & lolos aturan ukuran di "${workDir}".`,
-            `4) Tulis file test singkat di "${workDir}" dan jalankan check/verifikasi cepat (<5 detik).`,
-            `5) Segera akhiri sesi dengan ringkasan 2 kalimat.`
-          ].join("\n");
-
-          let rawOpenclawOutput = "";
           let buildWarning = "";
           try {
-            rawOpenclawOutput = execFileSync(
+            execFileSync(
               "openclaw",
-              ["agent", "--local", "--session-id", sessionId, "--timeout", "210", "--json", "--message", buildPrompt],
+              ["agent", "--local", "--session-id", sessionId, "--timeout", "180", "--json", "--message", buildPrompt],
               {
                 cwd: workspace,
                 env,
                 encoding: "utf8",
-                timeout: 240000,
+                timeout: 210000,
                 killSignal: "SIGKILL",
                 maxBuffer: 25 * 1024 * 1024
               }
             );
           } catch (err) {
-            rawOpenclawOutput = (err.stdout || "").toString();
-            buildWarning = `⚠️ Catatan build: ${(err.message || "").slice(0, 180)}`;
+            buildWarning = `⚠️ Catatan sesi: ${(err.message || "").slice(0, 160)}`;
           }
 
           const files = fs.readdirSync(workDir).filter(f => !f.startsWith("."));
@@ -284,12 +373,6 @@ jobs:
           }
 
           // 4. Susun README.md lengkap dengan 3 live badge make.fun + link ke halaman bounty
-          const owner = "Screampie333";
-          const repoName = `makefun-${slug}`;
-          const repoFull = `${owner}/${repoName}`;
-          const repoUrl = `https://github.com/${repoFull}`;
-          const bountyUrl = `https://make.fun/bounty/${slug}`;
-
           const badgeComp = `https://make.fun/badge/${slug}.svg`;
           const badgeRank = `https://make.fun/badge/${slug}/${owner}/${repoName}/rank.svg`;
           const badgeReward = `https://make.fun/badge/${slug}/${owner}/${repoName}/reward.svg`;
@@ -306,8 +389,8 @@ jobs:
           const existingReadme = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, "utf8") : "";
           const templateRaw = reqData?.how_to_submit?.readme_template || reqData?.readme_template || "";
 
-          let finalReadme = "";
-          if (templateRaw) {
+          let finalReadme = existingReadme;
+          if (!finalReadme && templateRaw) {
             const runCmd = fs.existsSync(path.join(workDir, "main.py")) ? "python3 main.py" : "node index.js";
             finalReadme = String(templateRaw)
               .replaceAll("{owner}", owner).replaceAll("<owner>", owner)
@@ -316,8 +399,8 @@ jobs:
               .replaceAll("{description}", title).replaceAll("<description>", title)
               .replaceAll("{run_command}", runCmd).replaceAll("<run_command>", runCmd)
               .replaceAll("{referral_code}", "").replaceAll("<referral_code>", "");
-          } else {
-            finalReadme = existingReadme || `# ${title}\n\nAutonomous entry for ${slug}.\n`;
+          } else if (!finalReadme) {
+            finalReadme = `# ${title}\n\nAutonomous entry for ${slug}.\n`;
           }
 
           if (!finalReadme.includes(badgeComp) || !finalReadme.includes(badgeRank) || !finalReadme.includes(badgeReward) || !finalReadme.includes(bountyUrl)) {
@@ -325,13 +408,19 @@ jobs:
           }
           fs.writeFileSync(readmePath, finalReadme);
 
-          // 5. Push ke GitHub & lengkapi metadata repo_about (Homepage, Description, Topic makefun)
+          // 5. Commit & Push ke GitHub
           let commitSha = "";
           try {
             fs.writeFileSync(path.join(workDir, ".gitignore"), "__pycache__/\n*.pyc\nnode_modules/\n.env\n");
-            execFileSync("git", ["init"], { cwd: workDir, env, timeout: 30000 });
+            if (!fs.existsSync(path.join(workDir, ".git"))) {
+              execFileSync("git", ["init"], { cwd: workDir, env, timeout: 30000 });
+            }
             execFileSync("git", ["add", "-A"], { cwd: workDir, env, timeout: 30000 });
-            execFileSync("git", ["commit", "-m", `Initial entry for ${slug}`], { cwd: workDir, env, timeout: 30000 });
+            execFileSync(
+              "git",
+              ["commit", "--allow-empty", "-m", mode === "fix" ? `Auto-fix check failure for ${slug}` : `Initial entry for ${slug}`],
+              { cwd: workDir, env, timeout: 30000 }
+            );
             commitSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: workDir, env, encoding: "utf8", timeout: 30000 }).trim();
 
             let repoExists = false;
@@ -356,11 +445,10 @@ jobs:
               { cwd: workDir, env, timeout: 30000 }
             );
           } catch (err) {
-            await notify(`⚠️ Kode selesai dibuat, tapi gagal push/update About di GitHub (${repoFull}):\n${(err.message || "").slice(0, 600)}`);
+            await notify(`⚠️ Gagal push ke GitHub (${repoFull}):\n${(err.message || "").slice(0, 600)}`);
             process.exit(1);
           }
 
-          // Tunggu 5 detik agar GitHub selesai mengindeks README, LICENSE, dan About
           await new Promise(resolve => setTimeout(resolve, 5000));
 
           // 6. Ekstrak seluruh log sesi OpenClaw dari .jsonl maupun SQLite agent-db
@@ -421,7 +509,7 @@ jobs:
             fs.writeFileSync("/tmp/openclaw_session_backup.jsonl", transcriptRaw);
           }
 
-          // 7. Kirim multipart/form-data ke POST /api/competitions/{slug}/submissions
+          // 7. Submit / Resubmit ke POST /api/competitions/{slug}/submissions
           const submitUrl = `https://make.fun/api/competitions/${slug}/submissions`;
           let submitResultText = "";
 
@@ -443,15 +531,20 @@ jobs:
               body: fd
             });
             const subTxt = await subRes.text();
-            submitResultText = `HTTP ${subRes.status}:\n${subTxt.slice(0, 1500)}`;
+            submitResultText = `HTTP ${subRes.status}:\n${subTxt.slice(0, 1400)}`;
           } catch (err) {
             submitResultText = `Error koneksi submit: ${err.message}`;
           }
 
+          const headerTitle = mode === "fix"
+            ? `🛠️ Auto-Fix & Resubmit: ${title} (${slug})`
+            : `🚀 Autopilot Bounty: ${title} (${slug})`;
+
           const finalReport = [
-            `🚀 Autopilot Bounty: ${title} (${slug})`,
+            headerTitle,
             `📦 Repo GitHub: ${repoUrl}`,
             `🔖 Commit: ${commitSha.slice(0, 7)} | Transcript lines: ${transcriptLines.length}`,
+            mode === "fix" ? `🩹 Error sebelumnya:\n${failedDetail.slice(0, 450)}` : "",
             buildWarning,
             "",
             "📤 Hasil Submit API make.fun:",
