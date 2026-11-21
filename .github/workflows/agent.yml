@@ -1,4 +1,45 @@
-- name: Setup OpenClaw & Binance Skills
+name: Binance Agent 24/7 Worker
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [telegram-command]
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install baw CLI & OpenClaw
+        run: |
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+          npm install -g @binance/agentic-wallet@1.12.0 openclaw@latest
+
+      - name: Restore Binance Wallet Session
+        env:
+          BAW_SESSION_B64: ${{ secrets.BAW_SESSION_B64 }}
+        run: |
+          echo "$BAW_SESSION_B64" | base64 -d > /tmp/baw.tar.gz
+          tar -xzf /tmp/baw.tar.gz -C "$HOME"
+          rm -f /tmp/baw.tar.gz
+          chmod 700 "$HOME/.baw"
+          baw wallet status --json
+
+      - name: Setup OpenClaw & Binance Skills
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
