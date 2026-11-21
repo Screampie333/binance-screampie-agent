@@ -21,18 +21,23 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          baw auth signin > /tmp/signin.log 2>&1 &
+          script -q -f -c "baw auth signin" /tmp/signin.log > /dev/null 2>&1 &
           SIGNIN_PID=$!
 
-          for i in $(seq 1 15); do
-            QR_URL=$(grep -oE 'https://app\.binance\.com/uni-qr/[a-zA-Z0-9_-]+' /tmp/signin.log | head -n 1 || true)
-            [ -n "$QR_URL" ] && break
+          for i in $(seq 1 25); do
+            if grep -q "http" /tmp/signin.log 2>/dev/null; then
+              sleep 2
+              break
+            fi
             sleep 1
           done
 
+          CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176' | head -c 3500)
+
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🔑 SEGERA SCAN LINK INI (berlaku 60 detik): ${QR_URL}"
+            --data-urlencode "text=🔑 SEGERA SCAN LINK DI BAWAH INI:
+${CLEAN_LOG}"
 
           wait $SIGNIN_PID || baw auth verify || true
 
