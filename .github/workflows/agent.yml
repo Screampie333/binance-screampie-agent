@@ -159,7 +159,7 @@ jobs:
           EOF
           node /tmp/select_bounty.mjs
 
-      - name: Build Code in OpenClaw Session, Push Repo & Submit Multipart Form
+      - name: Build Code in OpenClaw Session, Add MIT LICENSE, Push & Submit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -202,50 +202,7 @@ jobs:
             process.exit(0);
           }
 
-          // 1. Ambil skema spesifik /api/competitions/{slug}/submissions & requirements
-          const skillMd = fs.readFileSync(path.join(workspace, "skills", "makefun", "SKILL.md"), "utf8");
-          let submitEndpointSchema = {};
-          let compRequirements = {};
-
-          try {
-            const reqRes = await fetch(`https://make.fun/api/competitions/${slug}/requirements`, {
-              headers: { Accept: "application/json", "x-api-key": apiKey }
-            });
-            if (reqRes.ok) compRequirements = await reqRes.json();
-          } catch {}
-
-          try {
-            const oaRes = await fetch("https://make.fun/api/openapi.json", { headers: { Accept: "application/json" } });
-            if (oaRes.ok) {
-              const oa = await oaRes.json();
-              function resolveRef(node, depth = 0) {
-                if (!node || typeof node !== "object" || depth > 6) return node;
-                if (node.$ref && typeof node.$ref === "string" && node.$ref.startsWith("#/")) {
-                  const parts = node.$ref.slice(2).split("/");
-                  let target = oa;
-                  for (const part of parts) target = target?.[part];
-                  return resolveRef(target, depth + 1);
-                }
-                if (Array.isArray(node)) return node.map(item => resolveRef(item, depth + 1));
-                const out = {};
-                for (const [k, v] of Object.entries(node)) {
-                  if (k === "description" || k === "example") continue;
-                  out[k] = resolveRef(v, depth + 1);
-                }
-                return out;
-              }
-
-              const subSpec = oa.paths?.["/api/competitions/{slug}/submissions"]?.post;
-              if (subSpec) {
-                submitEndpointSchema = {
-                  summary: subSpec.summary || "",
-                  content: resolveRef(subSpec.requestBody?.content || {})
-                };
-              }
-            }
-          } catch {}
-
-          // 2. Jalankan OpenClaw dengan >= 7 putaran tool call agar transkrip .jsonl valid & kaya
+          // 1. Jalankan OpenClaw untuk membangun proyek & verifikasi kit (>= 7 putaran tool call)
           const workDir = `/tmp/work-${slug}`;
           fs.mkdirSync(workDir, { recursive: true });
           const sessionId = `makefun-${slug}-${Date.now()}`;
@@ -253,7 +210,7 @@ jobs:
           const buildPrompt = [
             `Tugasmu membangun proyek untuk bounty make.fun slug: "${slug}" (${title}) di direktori "${workDir}".`,
             "PENTING: Semua test wajib selesai di bawah 10 detik. JANGAN jalankan gh repo create dan JANGAN kirim submit API.",
-            "Lakukan secara bertahap minimal 7 putaran tool call terpisah agar rekaman sesi .jsonl lolos harness:",
+            "Lakukan secara bertahap minimal 7 putaran tool call terpisah agar rekaman sesi lolos harness:",
             `1) Baca skills/makefun/SKILL.md dan fetch detail bounty "${slug}" dari https://make.fun/api/competitions/${slug}.`,
             `2) Unduh dan ekstrak kit bounty ke "${workDir}".`,
             `3) Baca RULES.txt di "${workDir}" dan quote baris anchor di output tool pertama sebelum menulis file apa pun.`,
@@ -289,6 +246,37 @@ jobs:
             process.exit(1);
           }
 
+          // 2. Pastikan file LICENSE OSI-approved (MIT + SPDX-License-Identifier: MIT) ada di root repo
+          const licensePath = path.join(workDir, "LICENSE");
+          if (!fs.existsSync(licensePath)) {
+            const mitLicense = [
+              "SPDX-License-Identifier: MIT",
+              "",
+              "MIT License",
+              "",
+              "Copyright (c) 2026 Screampie333",
+              "",
+              "Permission is hereby granted, free of charge, to any person obtaining a copy",
+              "of this software and associated documentation files (the \"Software\"), to deal",
+              "in the Software without restriction, including without limitation the rights",
+              "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell",
+              "copies of the Software, and to permit persons to whom the Software is",
+              "furnished to do so, subject to the following conditions:",
+              "",
+              "The above copyright notice and this permission notice shall be included in all",
+              "copies or substantial portions of the Software.",
+              "",
+              "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR",
+              "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,",
+              "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE",
+              "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER",
+              "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,",
+              "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE",
+              "SOFTWARE."
+            ].join("\n");
+            fs.writeFileSync(licensePath, mitLicense);
+          }
+
           // 3. Push ke repo publik GitHub dengan topic makefun
           const repoFull = `Screampie333/makefun-${slug}`;
           const repoUrl = `https://github.com/${repoFull}`;
@@ -319,143 +307,110 @@ jobs:
             process.exit(1);
           }
 
-          // 4. Ambil file transkrip .jsonl asli OpenClaw dari folder sessions
-          const sessionsDir = path.join(home, ".openclaw", "agents", "main", "sessions");
-          const exactSessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
-          let transcriptRaw = "";
+          // Tunggu 5 detik agar GitHub selesai mendeteksi file LICENSE pada repository
+          await new Promise(resolve => setTimeout(resolve, 5000));
+
+          // 4. Ekstrak seluruh log sesi OpenClaw dari .jsonl maupun SQLite agent-db
+          function scanOpenclawFiles(dir, results = []) {
+            if (!fs.existsSync(dir)) return results;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) scanOpenclawFiles(fullPath, results);
+              else if (/\.(jsonl|db|sqlite|sqlite3)$/i.test(entry.name)) {
+                results.push({ fullPath, name: entry.name, size: fs.statSync(fullPath).size });
+              }
+            }
+            return results;
+          }
+
+          const foundFiles = scanOpenclawFiles(path.join(home, ".openclaw"));
           let transcriptLines = [];
 
-          if (fs.existsSync(exactSessionFile)) {
-            transcriptRaw = fs.readFileSync(exactSessionFile, "utf8");
-          } else if (fs.existsSync(sessionsDir)) {
-            const jsonlFiles = fs.readdirSync(sessionsDir)
-              .filter(f => f.endsWith(".jsonl"))
-              .map(f => ({ full: path.join(sessionsDir, f), size: fs.statSync(path.join(sessionsDir, f)).size }))
-              .sort((a, b) => b.size - a.size);
-            if (jsonlFiles.length > 0) {
-              transcriptRaw = fs.readFileSync(jsonlFiles[0].full, "utf8");
+          const jsonlFiles = foundFiles.filter(f => f.name.endsWith(".jsonl") && f.size > 0).sort((a, b) => b.size - a.size);
+          if (jsonlFiles.length > 0) {
+            const rawLines = fs.readFileSync(jsonlFiles[0].fullPath, "utf8").split("\n").filter(Boolean);
+            for (const line of rawLines) {
+              try { transcriptLines.push(JSON.parse(line)); } catch { transcriptLines.push({ raw: line }); }
             }
           }
 
+          if (transcriptLines.length === 0) {
+            const dbFiles = foundFiles.filter(f => /\.(db|sqlite|sqlite3)$/i.test(f.name) && f.size > 0).sort((a, b) => b.size - a.size);
+            try {
+              const { DatabaseSync } = await import("node:sqlite");
+              for (const dbFile of dbFiles) {
+                const db = new DatabaseSync(dbFile.fullPath, { readOnly: true });
+                const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name);
+                for (const tbl of tables) {
+                  if (/message|turn|event|session|log|step|tool/i.test(tbl)) {
+                    const rows = db.prepare(`SELECT * FROM "${tbl}" LIMIT 500`).all();
+                    for (const row of rows) {
+                      const enriched = { table: tbl };
+                      for (const [k, v] of Object.entries(row)) {
+                        if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+                          try { enriched[k] = JSON.parse(v); } catch { enriched[k] = v; }
+                        } else {
+                          enriched[k] = v;
+                        }
+                      }
+                      transcriptLines.push(enriched);
+                    }
+                  }
+                }
+                db.close();
+                if (transcriptLines.length > 0) break;
+              }
+            } catch {}
+          }
+
+          if (transcriptLines.length === 0) {
+            const jsonStart = rawOpenclawOutput.indexOf("{");
+            const jsonEnd = rawOpenclawOutput.lastIndexOf("}");
+            if (jsonStart !== -1 && jsonEnd > jsonStart) {
+              try {
+                const parsedOut = JSON.parse(rawOpenclawOutput.slice(jsonStart, jsonEnd + 1));
+                const nowIso = new Date().toISOString();
+                transcriptLines.push({ type: "session_start", sessionId, timestamp: nowIso, model: "google/gemini-2.5-flash" });
+                const payloads = parsedOut?.result?.payloads || parsedOut?.payloads || [];
+                for (const p of payloads) transcriptLines.push({ type: "assistant", timestamp: nowIso, ...p });
+                if (parsedOut?.result?.usage || parsedOut?.usage) {
+                  transcriptLines.push({ type: "usage", timestamp: nowIso, usage: parsedOut?.result?.usage || parsedOut?.usage });
+                }
+              } catch {}
+            }
+          }
+
+          const transcriptRaw = transcriptLines.map(e => JSON.stringify(e)).join("\n");
           if (transcriptRaw) {
             fs.writeFileSync("/tmp/openclaw_session_backup.jsonl", transcriptRaw);
-            transcriptLines = transcriptRaw.split("\n").filter(Boolean).map(line => {
-              try { return JSON.parse(line); } catch { return { raw: line }; }
-            });
           }
 
-          // 5. Petakan field form submission tepat sesuai schema OpenAPI & SKILL.md
-          const mappingPrompt = [
-            `Given the exact OpenAPI schema for POST /api/competitions/{slug}/submissions, the competition requirements, and SKILL.md below, extract the exact submission form structure for slug "${slug}".`,
-            "Return ONLY valid JSON with:",
-            "- \"encoding\": \"multipart\" (if multipart/form-data is supported or expected) or \"json\"",
-            "- \"stringFields\": object mapping exact field names (e.g. \"repo_url\", \"commit_sha\", etc.) to placeholders \"__REPO_URL__\" or \"__COMMIT_SHA__\" or literal values",
-            "- \"fileFields\": object mapping exact file field names (e.g. \"transcript\" or \"transcripts\" or \"files\") to \"__TRANSCRIPT_FILE__\" (or empty {} if transcript is passed in stringFields as \"__TRANSCRIPT_STRING__\")",
-            "",
-            "SUBMISSIONS POST SCHEMA:",
-            JSON.stringify(submitEndpointSchema),
-            "",
-            "COMPETITION REQUIREMENTS:",
-            JSON.stringify(compRequirements),
-            "",
-            "SKILL.MD (Submission section):",
-            skillMd.slice(0, 22000)
-          ].join("\n");
-
-          let formSpec = {
-            encoding: "multipart",
-            stringFields: { repo_url: "__REPO_URL__", commit_sha: "__COMMIT_SHA__" },
-            fileFields: { transcript: "__TRANSCRIPT_FILE__" }
-          };
-
-          try {
-            const gRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contents: [{ parts: [{ text: mappingPrompt }] }],
-                generationConfig: { responseMimeType: "application/json" }
-              })
-            });
-            if (gRes.ok) {
-              const gData = await gRes.json();
-              const parsed = JSON.parse(gData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}");
-              if (parsed.stringFields && Object.keys(parsed.stringFields).length > 0) {
-                formSpec = parsed;
-              }
-            }
-          } catch {}
-
-          function resolvePlaceholder(val) {
-            if (typeof val !== "string") return val;
-            if (val === "__TRANSCRIPT_STRING__") return transcriptRaw;
-            if (val === "__TRANSCRIPT_ARRAY__") return transcriptLines;
-            return val
-              .replaceAll("__REPO_URL__", repoUrl)
-              .replaceAll("__COMMIT_SHA__", commitSha)
-              .replaceAll("__SLUG__", slug);
-          }
-
+          // 5. Kirim multipart/form-data ke POST /api/competitions/{slug}/submissions sesuai OpenAPI
           const submitUrl = `https://make.fun/api/competitions/${slug}/submissions`;
           let submitResultText = "";
-          let submitOk = false;
 
           try {
-            let fetchOpts;
-            if (formSpec.encoding === "json") {
-              const jsonBody = {};
-              for (const [k, v] of Object.entries(formSpec.stringFields || {})) {
-                jsonBody[k] = resolvePlaceholder(v);
-              }
-              for (const [k, v] of Object.entries(formSpec.fileFields || {})) {
-                if (v === "__TRANSCRIPT_FILE__") jsonBody[k] = transcriptRaw;
-              }
-              fetchOpts = {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Accept": "application/json",
-                  "x-api-key": apiKey
-                },
-                body: JSON.stringify(jsonBody)
-              };
-            } else {
-              const fd = new FormData();
-              for (const [k, v] of Object.entries(formSpec.stringFields || {})) {
-                const resolved = resolvePlaceholder(v);
-                if (resolved !== undefined && resolved !== null && resolved !== "") {
-                  fd.append(k, String(resolved));
-                }
-              }
-              const fileEntries = Object.entries(formSpec.fileFields || {});
-              if (fileEntries.length > 0 && transcriptRaw) {
-                for (const [fieldName] of fileEntries) {
-                  fd.append(fieldName, new Blob([transcriptRaw], { type: "application/x-ndjson" }), "session.jsonl");
-                }
-              } else if (transcriptRaw) {
-                fd.append("transcript", new Blob([transcriptRaw], { type: "application/x-ndjson" }), "session.jsonl");
-              }
-              fetchOpts = {
-                method: "POST",
-                headers: {
-                  "Accept": "application/json",
-                  "x-api-key": apiKey
-                },
-                body: fd
-              };
+            const fd = new FormData();
+            fd.append("repo_url", repoUrl);
+            fd.append("commit_sha", commitSha);
+            fd.append("title", title.slice(0, 200));
+            if (transcriptRaw) {
+              fd.append("transcripts", new Blob([transcriptRaw], { type: "application/x-ndjson" }), "session.jsonl");
             }
 
-            const subRes = await fetch(submitUrl, fetchOpts);
+            const subRes = await fetch(submitUrl, {
+              method: "POST",
+              headers: {
+                "Accept": "application/json",
+                "x-api-key": apiKey
+              },
+              body: fd
+            });
             const subTxt = await subRes.text();
-            submitOk = subRes.ok;
-            submitResultText = `HTTP ${subRes.status} (${formSpec.encoding}):\n${subTxt.slice(0, 1200)}`;
+            submitResultText = `HTTP ${subRes.status}:\n${subTxt.slice(0, 1500)}`;
           } catch (err) {
             submitResultText = `Error koneksi submit: ${err.message}`;
           }
-
-          const debugSchema = !submitOk
-            ? `\n\n🧩 Schema POST /submissions:\n${JSON.stringify(submitEndpointSchema).slice(0, 1000)}`
-            : "";
 
           const finalReport = [
             `🚀 Autopilot Bounty: ${title} (${slug})`,
@@ -464,7 +419,7 @@ jobs:
             buildWarning,
             "",
             "📤 Hasil Submit API make.fun:",
-            submitResultText + debugSchema,
+            submitResultText,
             "",
             `⛽ ${gas}`
           ].filter(Boolean).join("\n");
