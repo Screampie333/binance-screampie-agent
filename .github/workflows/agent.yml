@@ -17,32 +17,34 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           npm install -g @binance/agentic-wallet@1.12.0
 
-      - name: Start Linux Login & Send QR Image to Telegram
+      - name: Start Linux Login & Send Real QR Image to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BROWSER: echo
         run: |
           script -q -f -c "baw auth signin" /tmp/signin.log > /dev/null 2>&1 &
           SIGNIN_PID=$!
 
           for i in $(seq 1 25); do
             if grep -q "QR Code ID:" /tmp/signin.log 2>/dev/null; then
-              sleep 1
+              sleep 2
               break
             fi
             sleep 1
           done
 
           CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176')
-          QR_ID=$(echo "$CLEAN_LOG" | grep -oE 'QR Code ID:[[:space:]]*[a-zA-Z0-9-]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+          REAL_URL=$(echo "$CLEAN_LOG" | grep -oE 'https://[^[:space:]]+' | head -n 1)
           PAIR_CODE=$(echo "$CLEAN_LOG" | grep -oE 'Pairing code:[[:space:]]*[a-zA-Z0-9]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
 
-          qrencode -s 10 -o /tmp/qr.png "bnc://app.binance.com/cedefi/agentic-wallet-login?qrCodeId=${QR_ID}"
+          qrencode -s 10 -o /tmp/qr.png "$REAL_URL"
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
             -F chat_id="${TELEGRAM_CHAT_ID}" \
             -F photo=@/tmp/qr.png \
-            -F caption="🔑 SCAN QR INI DARI APLIKASI BINANCE (Pairing Code: ${PAIR_CODE})"
+            -F caption="🔑 SCAN QR INI DARI APLIKASI BINANCE (Pairing Code: ${PAIR_CODE})
+URL: ${REAL_URL}"
 
           wait $SIGNIN_PID || baw auth verify || true
 
