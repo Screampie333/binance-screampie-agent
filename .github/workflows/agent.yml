@@ -6,7 +6,7 @@ on:
 jobs:
   generate-linux-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
 
     steps:
       - name: Install baw CLI
@@ -16,7 +16,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           npm install -g @binance/agentic-wallet@1.12.0
 
-      - name: Start Linux Login & Send QR to Telegram
+      - name: Start Linux Login & Send QR Link to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -25,15 +25,19 @@ jobs:
           SIGNIN_PID=$!
 
           for i in $(seq 1 25); do
-            if grep -q "http" /tmp/signin.log 2>/dev/null; then
-              sleep 2
+            if grep -q "QR Code ID:" /tmp/signin.log 2>/dev/null; then
+              sleep 1
               break
             fi
             sleep 1
           done
 
-          CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176' | head -c 3500)
-          MSG_QR=$(printf "🔑 SEGERA SCAN LINK DI BAWAH INI:\n%s" "$CLEAN_LOG")
+          CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' /tmp/signin.log | tr -cd '\11\12\15\40-\176')
+          QR_ID=$(echo "$CLEAN_LOG" | grep -oE 'QR Code ID:[[:space:]]*[a-zA-Z0-9-]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+          PAIR_CODE=$(echo "$CLEAN_LOG" | grep -oE 'Pairing code:[[:space:]]*[a-zA-Z0-9]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+          QR_LINK="https://app.binance.com/uni-qr/${QR_ID}"
+
+          MSG_QR=$(printf "🔑 KLIK LINK DI BAWAH UNTUK LOGIN:\n%s\n\nPairing Code: %s" "$QR_LINK" "$PAIR_CODE")
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
