@@ -68,34 +68,132 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
         run: |
-          GAS_REPORT=$(node -e '
-            async function getGas(name, rpcUrl) {
-              try {
-                const res = await fetch(rpcUrl, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_gasPrice", params: [] })
-                });
-                const json = await res.json();
-                const wei = BigInt(json.result || "0x0");
-                const gwei = (Number(wei) / 1e9).toFixed(3);
-                return `${name}: ${gwei} Gwei`;
-              } catch {
-                return `${name}: unavailable`;
-              }
-            }
-            (async () => {
-              const bsc = await getGas("BSC (Chain 56)", "https://bsc-dataseed.binance.org");
-              const base = await getGas("Base (Chain 8453)", "https://mainnet.base.org");
-              const eth = await getGas("Ethereum (Chain 1)", "https://eth.llamarpc.com");
-              console.log([bsc, base, eth].join(" | "));
-            })();
-          ')
-          echo "GAS_REPORT=${GAS_REPORT}" >> $GITHUB_ENV
+          cat <<'EOF' > /tmp/fetch_feeds.mjs
+          import fs from "node:fs";
 
-          MAKEFUN_FEED=$(node -e '
-            (async () => {
+          const envFile = process.env.GITHUB_ENV;
+          function setEnv(name, value) {
+            const delim = `EOF_${name}_${Date.now()}`;
+            fs.appendFileSync(envFile, `${name}<<${delim}\n${value}\n${delim}\n`);
+          }
+
+          async function getGas(name, rpcUrl) {
+            try {
+              const res = await fetch(rpcUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_gasPrice", params: [] })
+              });
+              const json = await res.json();
+              const wei = BigInt(json.result || "0x0");
+              const gwei = (Number(wei) / 1e9).toFixed(3);
+              return `${name}: ${gwei} Gwei`;
+            } catch {
+              return `${name}: unavailable`;
+            }
+          }
+
+          const gasList = await Promise.all([
+            getGas("BSC (Chain 56)", "https://bsc-dataseed.binance.org"),
+            getGas("Base (Chain 8453)", "https://mainnet.base.org"),
+            getGas("Ethereum (Chain 1)", "https://eth.llamarpc.com")
+          ]);
+          setEnv("GAS_REPORT", gasList.join(" | "));
+
+          try {
+            const headers = { Accept: "application/json" };
+            if (process.env.MAKEFUN_API_KEY) headers["x-api-key"] = process.env.MAKEFUN_API_KEY;
+            const res = await fetch("https://make.fun/api/competitions?limit=200", { headers });
+            const data = await res.json();
+            const list = Array.isArray(data) ? data : (data.competitions || data.items || data.data || []);
+            const summary = list.slice(0, 15).map(item => {
+              const slug = item.slug || item.id || "";
+              const title = item.title || item.name || "Untitled";
+              const fee = item.entryFee ?? item.fee ?? item.price ?? 0;
+              const prize = item.prize ?? item.reward ?? "unknown";
+              const status = item.status || "open";
+              return `- [${slug}] ${title} | prize: ${prize} | fee: ${fee} | status: ${status}`;
+            }).join("\n");
+            setEnv("MAKEFUN_FEED", summary || "Tidak ada data kompetisi make.fun.");
+          } catch {
+            setEnv("MAKEFUN_FEED", "Gagal mengambil data make.fun API.");
+          }
+
+          const dcToken = process.env.DISCORD_BOT_TOKEN || "";
+          const dcChannels = (process.env.DISCORD_CHANNEL_ID || "").split(",").map(s => s.trim()).filter(Boolean);
+          if (dcToken && dcChannels.length > 0) {
+            const allMsgs = [];
+            for (const chId of dcChannels) {
               try {
-                const headers = { "Accept": "application/json" };
-                if (process.env.MAKEFUN_API_KEY) headers["x-api-key"] = process.env.MAKEFUN_API_KEY;
-                const res = await fetch("
+                const res = await fetch(`https://discord.com/api/v10/channels/${chId}/messages?limit=5`, {
+                  headers: { Authorization: `Bot ${dcToken}` }
+                });
+                const list = await res.json();
+                if (Array.isArray(list)) {
+                  allMsgs.push(...list.map(m => `[Channel:${chId} | ${m.author?.username}]: ${m.content}`));
+                }
+              } catch {}
+            }
+            setEnv("DISCORD_FEED", allMsgs.join("\n"));
+          } else {
+            setEnv("DISCORD_FEED", "");
+          }
+          EOF
+          node /tmp/fetch_feeds.mjs
+
+      - name: Execute Agent Cycle & Notify Telegram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
+          USER_CMD: ${{ github.event.client_payload.command }}
+        run: |
+          cat <<'EOF' > /tmp/run_agent.mjs
+          import { execFileSync } from "node:child_process";
+          import os from "node:os";
+          import path from "node:path";
+
+          const home = os.homedir();
+          const workspace = path.join(home, ".openclaw", "workspace");
+          const env = {
+            ...process.env,
+            PATH: `${path.join(home, ".npm-global", "bin")}:${process.env.PATH || ""}`
+          };
+
+          const cmd = process.env.USER_CMD || "";
+          const gas = process.env.GAS_REPORT || "";
+          const mf = process.env.MAKEFUN_FEED || "";
+          const dc = process.env.DISCORD_FEED || "";
+
+          const prompt = cmd
+            ? `Perintah langsung dari user (${cmd}). Gas saat ini: ${gas}.\nDaftar bounty make.fun terbaru:\n${mf}\nGunakan skill makefun di skills/makefun/SKILL.md dan jawab dengan rapi, singkat, dan langsung ke inti (maksimal 1500 karakter).`
+            : `Gas saat ini: ${gas}.\n\nBounty make.fun terbaru:\n${mf}\n\nPesan Discord terbaru:\n${dc}\n\nIkuti aturan di AGENTS.md dan skills/makefun/SKILL.md. Saring bounty GRATIS ($0) di make.fun (cek prerequisites-nya), laporkan bounty berbayar atau yang butuh aksi manual (X/YouTube/Roblox) ke owner, dan saring peluang Free Mint on-chain yang aman (tolak link t.me / bot pihak ketiga / tawaran akses wallet). Tulis laporan rapi maksimal 1500 karakter.`;
+
+          let cleanMsg = "";
+          try {
+            const raw = execFileSync("openclaw", ["agent", "--local", "--json", "--message", prompt], {
+              cwd: workspace,
+              env,
+              encoding: "utf8",
+              maxBuffer: 10 * 1024 * 1024
+            });
+            const start = raw.indexOf("{");
+            if (start !== -1) {
+              const data = JSON.parse(raw.slice(start));
+              cleanMsg = data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
+            }
+          } catch {}
+
+          const msg = (cleanMsg || `⛽ Gas Fee: ${gas}`).slice(0, 3800);
+          const botToken = process.env.TELEGRAM_BOT_TOKEN;
+          const chatId = process.env.TELEGRAM_CHAT_ID;
+
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text: msg })
+          });
+          EOF
+          node /tmp/run_agent.mjs
