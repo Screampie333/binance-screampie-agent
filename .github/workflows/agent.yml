@@ -9,12 +9,13 @@ jobs:
     timeout-minutes: 6
 
     steps:
-      - name: Install baw CLI & QR Generator
+      - name: Install baw CLI & qrencode
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qrencode
           mkdir -p "$HOME/.npm-global"
           npm config set prefix "$HOME/.npm-global"
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
-          npm install -g @binance/agentic-wallet@1.12.0 qrcode
+          npm install -g @binance/agentic-wallet@1.12.0
 
       - name: Start Linux Login & Send QR Image to Telegram
         env:
@@ -36,12 +37,7 @@ jobs:
           QR_ID=$(echo "$CLEAN_LOG" | grep -oE 'QR Code ID:[[:space:]]*[a-zA-Z0-9-]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
           PAIR_CODE=$(echo "$CLEAN_LOG" | grep -oE 'Pairing code:[[:space:]]*[a-zA-Z0-9]+' | awk -F': ' '{print $2}' | tr -d '[:space:]')
 
-          # Buat gambar QR PNG asli dari URI Binance
-          node -e "
-            const QRCode = require('qrcode');
-            QRCode.toFile('/tmp/qr.png', 'bnc://app.binance.com/cedefi/agentic-wallet-login?qrCodeId=${QR_ID}', { width: 400 }, () => {});
-          "
-          sleep 1
+          qrencode -s 10 -o /tmp/qr.png "bnc://app.binance.com/cedefi/agentic-wallet-login?qrCodeId=${QR_ID}"
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
             -F chat_id="${TELEGRAM_CHAT_ID}" \
