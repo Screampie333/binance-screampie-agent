@@ -21,15 +21,14 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Configure Git & GitHub CLI Auth
+      - name: Configure Git & GitHub Auth
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           git config --global user.name "Screampie333"
           git config --global user.email "screampie333@users.noreply.github.com"
           if [ -n "$GH_PAT" ]; then
-            printf "%s\n" "$GH_PAT" | gh auth login --with-token
-            gh auth setup-git
+            git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
           fi
 
       - name: Install OpenClaw, make.fun Skill & Web3 Skills
@@ -79,7 +78,7 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           cat <<'EOF' > /tmp/fetch_feeds.mjs
           import fs from "node:fs";
@@ -131,4 +130,124 @@ jobs:
               const prize = item.prize ?? item.reward ?? "unknown";
               return `- [${slug}] ${title} | prize: ${prize} | fee: $0 | status: open`;
             }).join("\n");
-            setEnv("MAKEFUN_FEED", summary || "
+            setEnv("MAKEFUN_FEED", summary || "Tidak ada free bounty ($0) yang open saat ini.");
+          } catch {
+            setEnv("MAKEFUN_FEED", "Gagal mengambil data make.fun API.");
+          }
+
+          let existingRepos = "Belum ada repo makefun.";
+          try {
+            if (process.env.GH_TOKEN) {
+              const out = execFileSync("gh", ["repo", "list", "Screampie333", "--topic", "makefun", "--limit", "100", "--json", "name,url,createdAt"], { encoding: "utf8" });
+              existingRepos = out.trim() || existingRepos;
+            }
+          } catch {}
+          setEnv("EXISTING_REPOS", existingRepos);
+
+          const dcToken = process.env.DISCORD_BOT_TOKEN || "";
+          const dcChannels = (process.env.DISCORD_CHANNEL_ID || "").split(",").map(s => s.trim()).filter(Boolean);
+          if (dcToken && dcChannels.length > 0) {
+            const allMsgs = [];
+            for (const chId of dcChannels) {
+              try {
+                const res = await fetch(`https://discord.com/api/v10/channels/${chId}/messages?limit=5`, {
+                  headers: { Authorization: `Bot ${dcToken}` }
+                });
+                const list = await res.json();
+                if (Array.isArray(list)) {
+                  allMsgs.push(...list.map(m => `[Channel:${chId} | ${m.author?.username}]: ${m.content}`));
+                }
+              } catch {}
+            }
+            setEnv("DISCORD_FEED", allMsgs.join("\n"));
+          } else {
+            setEnv("DISCORD_FEED", "");
+          }
+          EOF
+          node /tmp/fetch_feeds.mjs
+
+      - name: Execute Full Autopilot Builder & Notify Telegram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAKEFUN_API_KEY: ${{ secrets.MAKEFUN_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          USER_CMD: ${{ github.event.client_payload.command }}
+        run: |
+          cat <<'EOF' > /tmp/run_agent.mjs
+          import { execFileSync } from "node:child_process";
+          import os from "node:os";
+          import path from "node:path";
+
+          const home = os.homedir();
+          const workspace = path.join(home, ".openclaw", "workspace");
+          const env = {
+            ...process.env,
+            PATH: `${path.join(home, ".npm-global", "bin")}:${process.env.PATH || ""}`
+          };
+
+          const cmd = process.env.USER_CMD || "";
+          const gas = process.env.GAS_REPORT || "";
+          const mf = process.env.MAKEFUN_FEED || "";
+          const repos = process.env.EXISTING_REPOS || "";
+          const dc = process.env.DISCORD_FEED || "";
+
+          const baseContext = [
+            `Gas saat ini: ${gas}`,
+            "Repo makefun yang sudah ada di akun Screampie333 (lewati semua slug yang sudah ada di sini):",
+            repos,
+            "",
+            "Kandidat bounty GRATIS ($0) berstatus open di make.fun:",
+            mf,
+            "",
+            "Feed Discord terbaru:",
+            dc
+          ].join("\n");
+
+          const prompt = cmd
+            ? [
+                `Perintah langsung dari owner: "${cmd}".`,
+                baseContext,
+                "Jalankan dalam mode FULL AUTOPILOT sesuai AGENTS.md dan skills/makefun/SKILL.md tanpa meminta konfirmasi. Tulis laporan ringkas maksimal 1800 karakter."
+              ].join("\n")
+            : [
+                "MODE FULL AUTOPILOT AKTIF. Jangan meminta konfirmasi atau melaporkan bounty yang di-skip.",
+                baseContext,
+                "Instruksi eksekusi langsung:",
+                "1) Baca AGENTS.md dan skills/makefun/SKILL.md.",
+                "2) Periksa kandidat bounty GRATIS ($0) di atas yang BELUM ada di daftar repo Screampie333. Cek GET https://make.fun/api/competitions/<slug>/requirements untuk setiap kandidat. Lewati otomatis semua bounty yang punya human-only steps (X/YouTube/Roblox/aksi manual).",
+                "3) Pilih 1 bounty terbaik yang 100% pure-code/otomatis dan LANGSUNG kerjakan sampai tuntas: unduh kit, baca RULES.txt, quote anchor line di tool result pertama, tulis kode dengan tools di sesi ini (>=30% authored lines), jalankan check kit sampai lulus 100%, buat repo publik baru di Screampie333 (topic: makefun) dan push, bundel transcript sesi dari ~/.openclaw/agents/main/sessions/, submit via API make.fun dengan header x-api-key, lalu poll status sampai terbaca scored.",
+                "4) Cek entry lama yang sudah scored: kirim claim code (rahasia) jika menang, atau jalankan post-mortem leaderboard jika kalah.",
+                "5) Tulis laporan ringkas hanya untuk pekerjaan yang dieksekusi & hasil submission ke Telegram owner maksimal 1800 karakter."
+              ].join("\n");
+
+          let cleanMsg = "";
+          try {
+            const raw = execFileSync("openclaw", ["agent", "--local", "--json", "--message", prompt], {
+              cwd: workspace,
+              env,
+              encoding: "utf8",
+              maxBuffer: 20 * 1024 * 1024
+            });
+            const start = raw.indexOf("{");
+            if (start !== -1) {
+              const data = JSON.parse(raw.slice(start));
+              cleanMsg = data?.result?.payloads?.[0]?.text || data?.payloads?.[0]?.text || data?.text || "";
+            }
+          } catch (err) {
+            cleanMsg = `⚠️ Siklus autopilot selesai dengan catatan: ${(err.message || "").slice(0, 400)}`;
+          }
+
+          const msg = (cleanMsg || `⛽ Gas Fee: ${gas}`).slice(0, 3800);
+          const botToken = process.env.TELEGRAM_BOT_TOKEN;
+          const chatId = process.env.TELEGRAM_CHAT_ID;
+
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text: msg })
+          });
+          EOF
+          node /tmp/run_agent.mjs
