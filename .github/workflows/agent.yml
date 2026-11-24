@@ -198,12 +198,11 @@ jobs:
                 return sSlug === slug.toLowerCase() || sRepo.includes(repo.name.toLowerCase());
               });
 
-              // Kasus (a): Repo ada di GitHub tapi 0 submission di make.fun (sebelumnya kena HTTP 422)
               if (mine.length === 0) {
                 mode = "retry_submit";
                 targetSlug = slug;
                 targetTitle = compObj.title || compObj.name || slug;
-                failedDetail = "Repo sudah ada di GitHub namun belum tercatat di make.fun (sebelumnya tertolak HTTP 422). Melakukan penandatanganan & submit ulang.";
+                failedDetail = "Repo sudah ada di GitHub namun belum tercatat di make.fun. Melakukan penandatanganan & submit ulang.";
                 break;
               }
 
@@ -236,7 +235,6 @@ jobs:
               const subStatus = String(detailObj.status || "").toLowerCase();
               if (/submitting|preparing|checking|queued|scoring|scored|valid/i.test(subStatus)) continue;
 
-              // Kasus (b): Entry terakhir gagal check
               if (/fail|reject|error/i.test(subStatus)) {
                 const cleanObj = {};
                 for (const [k, v] of Object.entries(detailObj)) {
@@ -471,7 +469,6 @@ jobs:
             fs.mkdirSync(workDir, { recursive: true });
           }
 
-          // Unduh kit kompetisi jika URL tersedia di metadata
           const kitUrl = compData.kitUrl || compData.kit_url || reqData.kitUrl || reqData.kit_url || `https://make.fun/api/competitions/${slug}/kit`;
           try {
             const kitRes = await fetch(kitUrl, { headers: { "x-api-key": apiKey } });
@@ -485,7 +482,6 @@ jobs:
             }
           } catch {}
 
-          // Daftarkan wallet Solana ke akun make.fun jika cli/makefun.mjs tersedia
           const kitCliPath = path.join(workDir, "cli", "makefun.mjs");
           if (walletSigner && fs.existsSync(kitCliPath)) {
             try {
@@ -760,23 +756,35 @@ jobs:
               fd.append("transcripts", new Blob([transcriptRaw], { type: "application/x-ndjson" }), "session.jsonl");
 
               const msgTemplate = reqData?.how_to_submit?.entry_message_template || reqData?.entry_message_template || "";
+              let filledMsg = "";
               if (walletSigner && msgTemplate) {
+                const nonce = crypto.randomBytes(16).toString("hex");
                 const transcriptSha = crypto.createHash("sha256").update(Buffer.from(transcriptRaw, "utf8")).digest("hex");
                 const nowIso = new Date().toISOString();
-                const filledMsg = String(msgTemplate)
+                const expiresIso = new Date(Date.now() + 9 * 60 * 1000).toISOString();
+
+                filledMsg = String(msgTemplate)
                   .replace(/\r\n/g, "\n")
+                  .replaceAll("{nonce}", nonce).replaceAll("<nonce>", nonce)
                   .replaceAll("{competition}", slug).replaceAll("<competition>", slug)
                   .replaceAll("{slug}", slug).replaceAll("<slug>", slug)
                   .replaceAll("{repo_url}", repoUrl).replaceAll("<repo_url>", repoUrl)
                   .replaceAll("{repo}", repoUrl).replaceAll("<repo>", repoUrl)
+                  .replaceAll("{repository}", repoUrl).replaceAll("<repository>", repoUrl)
                   .replaceAll("{commit_sha}", commitSha).replaceAll("<commit_sha>", commitSha)
                   .replaceAll("{commit}", commitSha).replaceAll("<commit>", commitSha)
                   .replaceAll("{transcript_sha256}", transcriptSha).replaceAll("<transcript_sha256>", transcriptSha)
                   .replaceAll("{transcripts_sha256}", transcriptSha).replaceAll("<transcripts_sha256>", transcriptSha)
+                  .replaceAll("{transcripts}", transcriptSha).replaceAll("<transcripts>", transcriptSha)
+                  .replaceAll("{sha256}", transcriptSha).replaceAll("<sha256>", transcriptSha)
                   .replaceAll("{wallet}", walletSigner.address).replaceAll("<wallet>", walletSigner.address)
                   .replaceAll("{address}", walletSigner.address).replaceAll("<address>", walletSigner.address)
+                  .replaceAll("{signer}", walletSigner.address).replaceAll("<signer>", walletSigner.address)
                   .replaceAll("{signed_at}", nowIso).replaceAll("<signed_at>", nowIso)
                   .replaceAll("{timestamp}", nowIso).replaceAll("<timestamp>", nowIso)
+                  .replaceAll("{issued_at}", nowIso).replaceAll("<issued_at>", nowIso)
+                  .replaceAll("{expires_at}", expiresIso).replaceAll("<expires_at>", expiresIso)
+                  .replaceAll("{round}", "1").replaceAll("<round>", "1")
                   .replace(/\n+$/, "");
 
                 const sigB58 = walletSigner.signUtf8(filledMsg);
@@ -793,7 +801,10 @@ jobs:
                 body: fd
               });
               const subTxt = await subRes.text();
-              submitResultText += `HTTP ${subRes.status}:\n${subTxt.slice(0, 1400)}`;
+              submitResultText += `HTTP ${subRes.status}:\n${subTxt.slice(0, 1100)}`;
+              if (!subRes.ok && filledMsg) {
+                submitResultText += `\n\n📝 Signed message:\n${filledMsg}`;
+              }
             } catch (err) {
               submitResultText += `Error koneksi submit: ${err.message}`;
             }
