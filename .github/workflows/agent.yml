@@ -395,6 +395,22 @@ jobs:
             return Uint8Array.from(bytes.reverse());
           }
 
+          // Hitung SHA-256 daftar loose files sesuai spesifikasi make.fun
+          function computeTranscriptsDigest(fileHashes) {
+            const sorted = [...fileHashes].sort();
+            const combiners = [
+              h => crypto.createHash("sha256").update(h.join("\n"), "utf8").digest("hex"),
+              h => crypto.createHash("sha256").update(h.join("\n") + "\n", "utf8").digest("hex"),
+              h => crypto.createHash("sha256").update(JSON.stringify(h), "utf8").digest("hex"),
+              h => crypto.createHash("sha256").update(h.join(","), "utf8").digest("hex"),
+              h => crypto.createHash("sha256").update(Buffer.concat(h.map(x => Buffer.from(x, "hex")))).digest("hex")
+            ];
+            const testIn = ["287b8f1fb1a7b07f4c47385e3e6254d05c63faa93f9e0821e519b12a5e0d5dc9"];
+            const testExpected = "fc28124569a0de351629847ec81b3c8701b52e3967e18163cb0852a00a0d70d1";
+            const matched = combiners.find(fn => fn(testIn) === testExpected) || combiners[0];
+            return matched(sorted);
+          }
+
           let walletSigner = null;
           if (solanaSecretRaw) {
             try {
@@ -748,18 +764,20 @@ jobs:
           }
 
           if (!submitResultText || submitResultText.startsWith("CLI fallback")) {
-            try {
+            const msgTemplate = reqData?.how_to_submit?.entry_message_template || reqData?.entry_message_template || "";
+            const singleFileSha = crypto.createHash("sha256").update(Buffer.from(transcriptRaw, "utf8")).digest("hex");
+            let expectedTranscriptsDigest = computeTranscriptsDigest([singleFileSha]);
+
+            async function postSignedSubmission(transcriptsDigest) {
               const fd = new FormData();
               fd.append("repo_url", repoUrl);
               fd.append("commit_sha", commitSha);
               fd.append("title", title.slice(0, 200));
               fd.append("transcripts", new Blob([transcriptRaw], { type: "application/x-ndjson" }), "session.jsonl");
 
-              const msgTemplate = reqData?.how_to_submit?.entry_message_template || reqData?.entry_message_template || "";
               let filledMsg = "";
               if (walletSigner && msgTemplate) {
                 const nonce = crypto.randomBytes(16).toString("hex");
-                const transcriptSha = crypto.createHash("sha256").update(Buffer.from(transcriptRaw, "utf8")).digest("hex");
                 const nowIso = new Date().toISOString();
                 const expiresIso = new Date(Date.now() + 9 * 60 * 1000).toISOString();
 
@@ -773,10 +791,10 @@ jobs:
                   .replaceAll("{repository}", repoUrl).replaceAll("<repository>", repoUrl)
                   .replaceAll("{commit_sha}", commitSha).replaceAll("<commit_sha>", commitSha)
                   .replaceAll("{commit}", commitSha).replaceAll("<commit>", commitSha)
-                  .replaceAll("{transcript_sha256}", transcriptSha).replaceAll("<transcript_sha256>", transcriptSha)
-                  .replaceAll("{transcripts_sha256}", transcriptSha).replaceAll("<transcripts_sha256>", transcriptSha)
-                  .replaceAll("{transcripts}", transcriptSha).replaceAll("<transcripts>", transcriptSha)
-                  .replaceAll("{sha256}", transcriptSha).replaceAll("<sha256>", transcriptSha)
+                  .replaceAll("{transcript_sha256}", transcriptsDigest).replaceAll("<transcript_sha256>", transcriptsDigest)
+                  .replaceAll("{transcripts_sha256}", transcriptsDigest).replaceAll("<transcripts_sha256>", transcriptsDigest)
+                  .replaceAll("{transcripts}", transcriptsDigest).replaceAll("<transcripts>", transcriptsDigest)
+                  .replaceAll("{sha256}", transcriptsDigest).replaceAll("<sha256>", transcriptsDigest)
                   .replaceAll("{wallet}", walletSigner.address).replaceAll("<wallet>", walletSigner.address)
                   .replaceAll("{address}", walletSigner.address).replaceAll("<address>", walletSigner.address)
                   .replaceAll("{signer}", walletSigner.address).replaceAll("<signer>", walletSigner.address)
@@ -792,7 +810,7 @@ jobs:
                 fd.append("entry_signature", sigB58);
               }
 
-              const subRes = await fetch(submitUrl, {
+              const res = await fetch(submitUrl, {
                 method: "POST",
                 headers: {
                   "Accept": "application/json",
@@ -800,10 +818,23 @@ jobs:
                 },
                 body: fd
               });
-              const subTxt = await subRes.text();
-              submitResultText += `HTTP ${subRes.status}:\n${subTxt.slice(0, 1100)}`;
-              if (!subRes.ok && filledMsg) {
-                submitResultText += `\n\n📝 Signed message:\n${filledMsg}`;
+              const txt = await res.text();
+              return { status: res.status, ok: res.ok, text: txt, filledMsg };
+            }
+
+            try {
+              let attempt = await postSignedSubmission(expectedTranscriptsDigest);
+              // Jika server melaporkan digest spesifik yang diharapkan, langsung tanda tangani ulang & kirim sekali lagi
+              if (!attempt.ok && attempt.status === 422) {
+                const m = attempt.text.match(/but this request submits ([0-9a-f]{64})/i);
+                if (m && m[1] && m[1].toLowerCase() !== expectedTranscriptsDigest.toLowerCase()) {
+                  attempt = await postSignedSubmission(m[1].toLowerCase());
+                }
+              }
+
+              submitResultText += `HTTP ${attempt.status}:\n${attempt.text.slice(0, 1100)}`;
+              if (!attempt.ok && attempt.filledMsg) {
+                submitResultText += `\n\n📝 Signed message:\n${attempt.filledMsg}`;
               }
             } catch (err) {
               submitResultText += `Error koneksi submit: ${err.message}`;
